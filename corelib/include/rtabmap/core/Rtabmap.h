@@ -24,7 +24,9 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
-
+/**
+ * RTAB-Map 是一种 图优化 + 回环检测 (loop closure) 的 SLAM 系统，这个类是主要的 SLAM 控制器。
+ */
 #ifndef RTABMAP_H_
 #define RTABMAP_H_
 
@@ -57,16 +59,19 @@ public:
 	enum VhStrategy {kVhNone, kVhEpipolar, kVhUndef};
 
 public:
+	/* 创建/销毁 rtabmap主体对象，包含所有内存、回环检测、图优化等模块 */ 
 	Rtabmap();
 	virtual ~Rtabmap();
 
 	/**
-	 * @brief Main loop of rtabmap.
-	 * @param data Sensor data to process.
-	 * @param odomPose Odometry pose, should be non-null for RGB-D SLAM mode.
-	 * @param covariance Odometry covariance.
+	 * @brief 主循环函数，用于输入一帧传感器数据（图像、深度、IMU、激光等），并使用提供的里程计姿态 odomPose 来更新地图。
+	 * @param data 当前帧的传感器数据（包含图像、深度、激光等）。
+	 * @param odomPose 当前帧的里程计位姿（对于RGB-D SLAM mode，此值必须非空）。
+	 * @param odomCovariance 6×6 协方差矩阵（默认单位矩阵）
+	 * @param odomVelocity 速度信息（可选）
 	 * @param externalStats External statistics to be saved in the database for convenience
-	 * @return true if data has been added to map.
+	 * 用户注入到数据库的自定义统计信息
+	 * @return true = 有新的关键帧/节点加入地图。
 	 */
 	bool process(
 			const SensorData & data,
@@ -75,6 +80,7 @@ public:
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 	// for convenience
+	// 使用两个方差值（线速度方差和角速度方差）代替协方差矩阵
 	bool process(
 			const SensorData & data,
 			Transform odomPose,
@@ -83,25 +89,23 @@ public:
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 	// for convenience, loop closure detection only
+	// 只进行回环检测，不需要里程计和深度
 	bool process(
 			const cv::Mat & image,
 			int id=0, const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 
 	/**
 	 * Initialize Rtabmap with parameters and a database
+	 * 初始化slam系统
 	 * @param parameters Parameters overriding default parameters and database parameters
-	 *                   (@see loadDatabaseParameters)
-	 * @param databasePath The database input/output path. If not set, an
-	 *                     empty database is used in RAM. If set and the file doesn't exist,
-	 *                     it will be created empty. If the database exists, nodes and
-	 *                     vocabulary will be loaded in working memory.
-	 * @param loadDatabaseParameters If an existing database is used (@see databasePath),
-	 *                               the parameters inside are loaded and set to current
-	 *                               Rtabmap instance.
+	 *                   (@see loadDatabaseParameters) 待设置的参数（覆盖默认值）
+	 * @param databasePath 数据库路径。 文件不存在->创建；文件存在->自动加载词袋、历史节点。
+	 * @param loadDatabaseParameters 如果数据库存在(@see databasePath),选择是否从数据库中读取参数覆盖当前参数
 	 */
 	void init(const ParametersMap & parameters, const std::string & databasePath = "", bool loadDatabaseParameters = false);
 	/**
 	 * Initialize Rtabmap with parameters from a configuration file and a database
+	 * 初始化，从.ini配置文件中加载参数
 	 * @param configFile Configuration file (*.ini) overriding default parameters and database parameters
 	 *                   (@see loadDatabaseParameters)
 	 * @param databasePath The database input/output path. If not set, an
@@ -116,6 +120,7 @@ public:
 
 	/**
 	 * Close rtabmap. This will delete rtabmap object if set.
+	 * 关闭 SLAM，保存或丢弃数据库。
 	 * @param databaseSaved true=database saved, false=database discarded.
 	 * @param databasePath output database file name, ignored if
 	 *                     Db/Sqlite3InMemory=false (opened database is
@@ -123,39 +128,57 @@ public:
 	 */
 	void close(bool databaseSaved = true, const std::string & ouputDatabasePath = "");
 
+	// 返回当前工作目录。
 	const std::string & getWorkingDir() const {return _wDir;}
+	// 判断是否为 RGB-D SLAM 模式。
 	bool isRGBDMode() const { return _rgbdSlamMode; }
-	int getLoopClosureId() const {return _loopClosureHypothesis.first;}
-	float getLoopClosureValue() const {return _loopClosureHypothesis.second;}
+	// 返回最近检测到的回环闭环 ID 和置信度。
+	int getLoopClosureId() const {return _loopClosureHypothesis.first;} // 回环ID
+	float getLoopClosureValue() const {return _loopClosureHypothesis.second;} // 回环置信度
+	// 最高回环判别结果（不一定被接受）。
 	int getHighestHypothesisId() const {return _highestHypothesis.first;}
 	float getHighestHypothesisValue() const {return _highestHypothesis.second;}
+	// 获取最新关键帧 ID。
 	int getLastLocationId() const;
-	std::list<int> getWM() const; // working memory
-	std::set<int> getSTM() const; // short-term memory
-	int getWMSize() const; // working memory size
-	int getSTMSize() const; // short-term memory size
-	std::map<int, int> getWeights() const;
-	int getTotalMemSize() const;
+	// 返回工作内存（WM）和短期记忆（STM）节点 ID 列表。
+	std::list<int> getWM() const; // 工作内存
+	std::set<int> getSTM() const; // 短期记忆
+	// 各内存大小。
+	int getWMSize() const; // 工作内存大小
+	int getSTMSize() const; // 短期记忆大小
+	std::map<int, int> getWeights() const; // 工作内存中签名id的权重 <signature id, weight>
+	int getTotalMemSize() const; // 总内存大小
 	double getLastProcessTime() const {return _lastProcessTime;};
+	// 是否存在短期记忆中
 	bool isInSTM(int locationId) const;
 	bool isIDsGenerated() const;
+	// 获取最新统计信息
 	const Statistics & getStatistics() const;
+	// 当前局部图优化后的位姿。
 	const std::map<int, Transform> & getLocalOptimizedPoses() const {return _optimizedPoses;}
+	// 局部约束（邻居边、回环边、地标边等）。
 	const std::multimap<int, Link> & getLocalConstraints() const {return _constraints;}
+	// 返回某节点的优化后位姿。
 	Transform getPose(int locationId) const;
+	// 
 	Transform getMapCorrection() const {return _mapCorrection;}
 	const Memory * getMemory() const {return _memory;}
 	float getGoalReachedRadius() const {return _goalReachedRadius;}
 	float getLocalRadius() const {return _localRadius;}
 	const Transform & getLastLocalizationPose() const {return _lastLocalizationPose;}
 
+	// SLAM 每次处理时间上限
 	float getTimeThreshold() const {return _maxTimeAllowed;} // in ms
 	void setTimeThreshold(float maxTimeAllowed); // in ms
+	// 工作内存最大节点数。
 	int getMemoryThreshold() const {return _maxMemoryAllowed;} // in nodes
 	void setMemoryThreshold(int maxMemoryAllowed); // in nodes
 
+	// 设置SLAM初始姿态
 	void setInitialPose(const Transform & initialPose);
+	// 强制开始新地图（例如漂移太大）
 	int triggerNewMap();
+	// 为某节点添加文本标签。
 	bool labelLocation(int id, const std::string & label);
 	/**
 	 * Set user data. Detect automatically if raw or compressed. If raw, the data is
@@ -163,32 +186,44 @@ public:
 	 * If you have one dimension unsigned 8 bits raw data, make sure to transpose it
 	 * (to have multiple rows instead of multiple columns) in order to be detected as
 	 * not compressed.
+	 * 为某节点附加用户自定义数据（自动压缩）。
 	 */
 	bool setUserData(int id, const cv::Mat & data);
+	// 导出 DOT 图文件，用于 GraphViz 可视化。
 	void generateDOTGraph(const std::string & path, int id=0, int margin=5);
+	// 输出位姿图（支持 g2o、toro、kitti 等格式）。
 	void exportPoses(
 			const std::string & path,
 			bool optimized,
 			bool global,
 			int format // 0=raw, 1=rgbd-slam format, 2=KITTI format, 3=TORO, 4=g2o
 	);
+	// 重置 SLAM 内存（清空 WM 和 STM）。
 	void resetMemory();
+	// 调试输出。
 	void dumpPrediction() const;
 	void dumpData() const;
+	// 读写参数。
 	void parseParameters(const ParametersMap & parameters);
 	const ParametersMap & getParameters() const {return _parameters;}
+	// 设置工作目录
 	void setWorkingDirectory(std::string path);
+	// 撤销最近一次闭环检测。
 	void rejectLastLoopClosure();
+	// 删除最后一个节点（调试用途）。
 	void deleteLastLocation();
+	// 直接设置优化图结果。
 	void setOptimizedPoses(const std::map<int, Transform> & poses, const std::multimap<int, Link> & constraints);
 	Signature getSignatureCopy(int id, bool images, bool scan, bool userData, bool occupancyGrid, bool withWords, bool withGlobalDescriptors) const;
 	// Use getGraph() instead with withImages=true, withScan=true, withUserData=true and withGrid=true.
+	// 旧版，已弃用
 	RTABMAP_DEPRECATED
 		void get3DMap(std::map<int, Signature> & signatures,
 				std::map<int, Transform> & poses,
 				std::multimap<int, Link> & constraints,
 				bool optimized,
 				bool global) const;
+	// 一次性导出：位姿图 约束 签名数据（图像、深度、栅格等），比旧版get3DMap更强大
 	void getGraph(std::map<int, Transform> & poses,
 			std::multimap<int, Link> & constraints,
 			bool optimized,
@@ -200,8 +235,10 @@ public:
 			bool withGrid = false,
 			bool withWords = true,
 			bool withGlobalDescriptors = true) const;
+	// 以某位姿或节点为中心搜索半径内节点。
 	std::map<int, Transform> getNodesInRadius(const Transform & pose, float radius, int k=0, std::map<int, float> * distsSqr=0); // If radius=0 and k=0, RGBD/LocalRadius is used. Can return landmarks.
 	std::map<int, Transform> getNodesInRadius(int nodeId, float radius, int k=0, std::map<int, float> * distsSqr=0); // If nodeId==0, return poses around latest node. If radius=0 and k=0, RGBD/LocalRadius is used. Can return landmarks and use landmark id (negative) as request.
+	// 尝试对图中更多节点做扩展回环检测。
 	int detectMoreLoopClosures(
 			float clusterRadiusMax = 0.5f,
 			float clusterAngle = M_PI/6.0f,
@@ -210,11 +247,13 @@ public:
 			bool interSession = true,
 			const ProgressState * state = 0,
 			float clusterRadiusMin = 0.0f);
+	// 对整张图执行全局 BA（Bundle Adjustment）。
 	bool globalBundleAdjustment(
 			int optimizerType = 1 /*g2o*/,
 			bool rematchFeatures = true,
 			int iterations = 0,
 			float pixelVariance = 0.0f);
+	// 清理局部栅格地图中不再需要部分。
 	int cleanupLocalGrids(
 			const std::map<int, Transform> & mapPoses,
 			const cv::Mat & map,
@@ -223,14 +262,20 @@ public:
 			float cellSize,
 			int cropRadius = 1,
 			bool filterScans = false);
+	// 重新估计图中某些约束（例如 ICP）。
 	int refineLinks();
+	// 手动添加一条图约束。
 	bool addLink(const Link & link);
+	// 根据协方差矩阵生成信息矩阵（逆矩阵）。
 	cv::Mat getInformation(const cv::Mat & covariance) const;
 	void addNodesToRepublish(const std::vector<int> & ids);
 
+	// 获取路径及状态。
 	int getPathStatus() const {return _pathStatus;} // -1=failed 0=idle/executing 1=success
 	void clearPath(int status); // -1=failed 0=idle/executing 1=success
+	// 基于节点 ID 规划路径。
 	bool computePath(int targetNode, bool global);
+	// 基于任意目标坐标规划路径。
 	bool computePath(const Transform & targetPose, float tolerance = -1.0f); // only in current optimized map, tolerance (m) < 0 means RGBD/LocalRadius, 0 means infinite
 	const std::vector<std::pair<int, Transform> > & getPath() const {return _path;}
 	std::vector<std::pair<int, Transform> > getPathNextPoses() const;
@@ -316,8 +361,8 @@ private:
 	float _proximityAngle;
 	bool _proximityOdomGuess;
 	double _proximityMergedScanCovFactor;
-	std::string _databasePath;
-	bool _optimizeFromGraphEnd;
+	std::string _databasePath;  // 地图数据路径
+	bool _optimizeFromGraphEnd;  // 决定在补算图时使用工作内存（WM）中的哪个节点作为起点（graph end 或 graph begin）。
 	float _optimizationMaxError;
 	bool _startNewMapOnLoopClosure;
 	bool _startNewMapOnGoodSignature;
@@ -364,7 +409,7 @@ private:
 
 	std::string _wDir;
 
-	std::map<int, Transform> _optimizedPoses;
+	std::map<int, Transform> _optimizedPoses;  // 存放从数据库或后端得到的（全局或局部）优化后节点
 	std::multimap<int, Link> _constraints;
 	Transform _mapCorrection;
 	Transform _mapCorrectionBackup; // used in localization mode when odom is lost

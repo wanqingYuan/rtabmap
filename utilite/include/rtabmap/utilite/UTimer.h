@@ -30,6 +30,7 @@
 #endif
 
 /**
+ * 统计代码耗时
  * This class is used to time some codes (in seconds).
  * On Unix, the resolution is up to microseconds (see gettimeofday()).
  * On Windows, the performance counter is used (see QueryPerformanceCounter() and QueryPerformanceFrequency()).
@@ -84,6 +85,7 @@ public:
     UTILITE_DEPRECATED double getInterval();
 
     /** 
+     * 自动暂停timer返回耗时，同时再次开启计时
      * This method is used to get the interval of 
      * the timer while it is running. It's automatically 
      * stop the timer, get the interval and restart 

@@ -74,6 +74,11 @@ public:
 
 	virtual void parseParameters(const ParametersMap & parameters);
 	virtual const ParametersMap & getParameters() const {return parameters_;}
+	/**
+	 * update() 决定了：
+	 * 1当前节点是否要加入图 2当前节点是否要与旧节点匹配（回环检测入口）
+	 * 3 odom pose 是否正确 4 特征提取是否成功 5 数据是否要压缩/保存 6 是否要产生新的回环候选
+	 */
 	bool update(const SensorData & data,
 			Statistics * stats = 0);
 	bool update(const SensorData & data,

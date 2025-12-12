@@ -186,6 +186,12 @@ Transform Registration::computeTransformation(
 	return computeTransformationMod(fromCopy, toCopy, guess, infoOut);
 }
 
+/**
+ * 这个函数是 RegistrationPipeline（视觉 + 深度 + 激光 + 用户）统一的入口。
+ * RTAB-Map 提供很多 Registration 模块：
+ * 视觉特征匹配（Feature-based）\RGBD ICP（Point-to-plane）\Laser ICP\Depth-to-depth ICP\多模态融合（Visual + ICP）\用户定制注册器 
+ * 而：computeTransformationMod() 是这些注册器的统一封装，负责按照顺序尝试各种约束方式来计算 from → to 的变换。
+ */
 Transform Registration::computeTransformationMod(
 		Signature & from,
 		Signature & to,

@@ -727,6 +727,7 @@ void Memory::parseParameters(const ParametersMap & parameters)
 			_registrationPipeline = 0;
 		}
 
+		// 根据配置构建_registrationPipeline，可以在BA时使用不同的computeTransformationImpl
 		_registrationPipeline = Registration::create(regStrategy, parameters_);
 
 		if(!_registrationPipeline->isImageRequired() && _registrationVis == 0)
@@ -877,6 +878,7 @@ bool Memory::update(
 		const std::vector<float> & velocity,
 		Statistics * stats)
 {
+	// 计时器初始化
 	UDEBUG("");
 	UTimer timer;
 	UTimer totalTimer;
@@ -885,15 +887,22 @@ bool Memory::update(
 
 	//============================================================
 	// Pre update...
+	// 内存清理、垃圾回收、深度更新等
 	//============================================================
 	UDEBUG("pre-updating...");
+	// 清理 trash（删除的节点）: 释放内存
+	// 更新外部传感器缓存 : IMU、GPS、激光数据等
+	// 处理延迟加载 : 数据库加载的 signature
+	// 清理旧的 link : 避免图膨胀
 	this->preUpdate();
 	t=timer.ticks()*1000;
+	// 统计时间存入
 	if(stats) stats->addStatistic(Statistics::kTimingMemPre_update(), t);
 	UDEBUG("time preUpdate=%f ms", t);
 
 	//============================================================
 	// Create a signature with the image received.
+	// 创建新的 Signature（关键步骤）
 	//============================================================
 	Signature * signature = this->createSignature(data, pose, stats);
 	if (signature == 0)
@@ -901,6 +910,7 @@ bool Memory::update(
 		UERROR("Failed to create a signature...");
 		return false;
 	}
+	// 写入速度信息（若有）
 	if(velocity.size()==6)
 	{
 		signature->setVelocity(velocity[0], velocity[1], velocity[2], velocity[3], velocity[4], velocity[5]);
@@ -911,8 +921,13 @@ bool Memory::update(
 	UDEBUG("time creating signature=%f ms", t);
 
 	// It will be added to the short-term memory, no need to delete it...
+	// 将 Signature 加入 STM（短期记忆）,covariance 用于 odometry 不确定性。
+	// 只保存最新的 N 个 signature : _maxStMemSize
+	// 数据快速访问 : 用于回环候选计算
+	// 匹配、重定位的核心数据存放在此
 	this->addSignatureToStm(signature, covariance);
 
+	// 设置 lastSignature
 	_lastSignature = signature;
 
 	//============================================================
@@ -920,11 +935,19 @@ bool Memory::update(
 	// Compare with the X last signatures. If different, add this
 	// signature like a parent to the memory tree, otherwise add
 	// it as a child to the similar signature.
+	// Rehearsal（重放）阶段：判断与最近节点是否相似
 	//============================================================
 	if(_incrementalMemory)
 	{
+		// 建图模式下
 		if(_similarityThreshold < 1.0f)
 		{
+			// 功能：避免重复场景导致图膨胀
+			// 判断当前图像是否与最近几个图像“太相似”，如果相似度超过阈值：
+			// 1 当前 signature 不会作为新节点加入图
+			// 2 它会变成“孩子节点”（child），合并到父节点上
+			// 3 避免图过度密集
+			// 4 提升在线性能
 			this->rehearsal(signature, stats);
 		}
 		t=timer.ticks()*1000;
@@ -933,6 +956,7 @@ bool Memory::update(
 	}
 	else
 	{
+		// 定位模式下: 只能做回环检测与定位; 若 WM 过小，将无法定位 → 警告
 		if(_workingMem.size() <= 1)
 		{
 			UWARN("The working memory is empty and the memory is not "
@@ -945,18 +969,25 @@ bool Memory::update(
 
 	//============================================================
 	// Transfer the oldest signature of the short-term memory to the working memory
+	// STM → WM 转移（保持 STM 大小）
 	//============================================================
+	// 先统计 STM 中非 intermediate（非子节点）的数量：
 	int notIntermediateNodesCount = 0;
 	for(std::set<int>::iterator iter=_stMem.begin(); iter!=_stMem.end(); ++iter)
 	{
 		const Signature * s = this->getSignature(*iter);
 		UASSERT(s != 0);
+		// < 0 : 子节点或非关键节点（intermediate node）
+		// >= 0 : 正常关键节点
 		if(s->getWeight() >= 0)
 		{
 			++notIntermediateNodesCount;
 		}
 	}
 	std::map<int, int> reducedIds;
+	// 如果 STM 过大，则转移最旧节点到 WM
+	// 这一步非常关键：保持 STM 大小不超过 _maxStMemSize
+	// 如果一个节点被移动到 WM：它可能会被 回环检测; 也可能移入 LTM（长期内存）以节省 RAM
 	while(_stMem.size() && _maxStMemSize>0 && notIntermediateNodesCount > _maxStMemSize)
 	{
 		int id = *_stMem.begin();
@@ -975,13 +1006,16 @@ bool Memory::update(
 			reducedIds.insert(std::make_pair(id, reducedTo));
 		}
 	}
+	// 记录 reducedIds（被压缩/合并的节点）, 用于调试。
 	if(stats) stats->setReducedIds(reducedIds);
 
+	// 更新 memoryChanged, 用于外部判断 memory 是否被修改，例如用于保存数据库。
 	if(!_memoryChanged && (_incrementalMemory || _localizationDataSaved))
 	{
 		_memoryChanged = true;
 	}
 
+	// 打印总时间并返回 true
 	UDEBUG("totalTimer = %fs", totalTimer.ticks());
 
 	return true;
@@ -2853,7 +2887,9 @@ void Memory::removeRawData(int id, bool image, bool scan, bool userData)
 	}
 }
 
-// compute transform fromId -> toId
+/**
+ * 计算 fromId → toId 的空间变换（即两个节点之间的 6DoF 位姿关系）。
+ */
 Transform Memory::computeTransform(
 		int fromId,
 		int toId,
@@ -2882,7 +2918,9 @@ Transform Memory::computeTransform(
 	return transform;
 }
 
-// compute transform fromId -> toId
+/**
+ * 计算 fromId → toId 的空间变换（即两个节点之间的 6DoF 位姿关系）。
+ */
 Transform Memory::computeTransform(
 		Signature & fromS,
 		Signature & toS,
@@ -2895,6 +2933,8 @@ Transform Memory::computeTransform(
 
 	// make sure we have all data needed
 	// load binary data from database if not in RAM (if image is already here, scan and userData should be or they are null)
+	// 保证所有必要的 sensorData 在 RAM 中, 视觉特征、深度、激光、用户数据等
+	// 因为 Signature 可能只有压缩图像，需要从数据库加载
 	if(((_reextractLoopClosureFeatures && (_registrationPipeline->isImageRequired() || guess.isNull())) && fromS.sensorData().imageCompressed().empty()) ||
 	   (_registrationPipeline->isScanRequired() && fromS.sensorData().imageCompressed().empty() && fromS.sensorData().laserScanCompressed().isEmpty()) ||
 	   (_registrationPipeline->isUserDataRequired() && fromS.sensorData().imageCompressed().empty() && fromS.sensorData().userDataCompressed().empty()))
@@ -2908,6 +2948,7 @@ Transform Memory::computeTransform(
 		toS.sensorData() = getNodeData(toS.id(), true, true, true, true);
 	}
 	// uncompress only what we need
+	// 然后解压需要的部分, 这样才能进行特征提取或 ICP、RGBD registration。
 	cv::Mat imgBuf, depthBuf, userBuf;
 	LaserScan laserBuf;
 	fromS.sensorData().uncompressData(
@@ -2923,6 +2964,9 @@ Transform Memory::computeTransform(
 
 
 	// compute transform fromId -> toId
+	// 构建临时 Signature 拷贝 tmpFrom, tmpTo
+	// 因为接下来的流程里会改变：特征描述子 words 可能局部拼图 邻居合成特征图（在 bundle case） 
+	// 不能修改原始两帧，因此使用临时变量
 	std::vector<int> inliersV;
 	if((_reextractLoopClosureFeatures && (_registrationPipeline->isImageRequired() || guess.isNull())) ||
 		(fromS.getWords().size() && toS.getWords().size()) ||
@@ -2944,9 +2988,12 @@ Transform Memory::computeTransform(
 			tmpTo = toS;
 		}
 
+		// RTAB-Map 为了稳定性，有两种情况需要重提取特征：
+		// loop closure refine or guess is null but视觉匹配需要图像
 		if(_reextractLoopClosureFeatures && (_registrationPipeline->isImageRequired() || guess.isNull()))
 		{
 			UDEBUG("");
+			// 重提取特征
 			tmpFrom.removeAllWords();
 			tmpFrom.sensorData().setFeatures(std::vector<cv::KeyPoint>(), std::vector<cv::Point3f>(), cv::Mat());
 			tmpTo.removeAllWords();
@@ -2954,13 +3001,17 @@ Transform Memory::computeTransform(
 		}
 		else if(useKnownCorrespondencesIfPossible)
 		{
+			// 使用已知特征对应（known correspondences）
 			// This will make RegistrationVis bypassing the correspondences computation
+			// 如果 skip matching（因为有已有匹配），则清空描述子让视觉匹配阶段跳过
 			tmpFrom.setWordsDescriptors(cv::Mat());
 			tmpTo.setWordsDescriptors(cv::Mat());
 		}
 
 		bool isNeighborRefining = fromS.getLinks().find(toS.id()) != fromS.getLinks().end() && fromS.getLinks().find(toS.id())->second.type() == Link::kNeighbor;
 
+		// 如果 guess 是空，且 pipeline 不使用视觉：就用纯视觉计算 guess 再喂给 full registration pipeline refine
+		// RTAB-Map 这么设计是为了保证最少始终可以估计位姿。
 		if(guess.isNull() && !_registrationPipeline->isImageRequired())
 		{
 			UDEBUG("");
@@ -2972,6 +3023,7 @@ Transform Memory::computeTransform(
 				transform = _registrationPipeline->computeTransformationMod(tmpFrom, tmpTo, guess, info);
 			}
 		}
+		// 是否进入 “Local Bundle Adjustment”
 		else if(!isNeighborRefining &&
 				_localBundleOnLoopClosure &&
 				_registrationPipeline->isImageRequired() &&
@@ -2985,12 +3037,20 @@ Transform Memory::computeTransform(
 			   !tmpFrom.getWords3().empty() &&
 			   fromS.hasLink(0, Link::kNeighbor)) // If doesn't have neighbors, skip bundle
 		{
+			// 对有 loop closure 的位置进行局部 BA（bundle adjustment）提高精度。
+			// Bundle adjustment 需要：
+			// 1 from 的所有相邻邻居节点（邻接链）2 它们的相机模型 3 3D word 点 4 多帧之间的链接关系
+			// 因此这里会做：
+			// 1 构建 words（3D map），从 fromS 开始累积所有邻居的 features。
+			// 2 构建 BA 图（bundlePoses, bundleLinks），让 g2o 后端做 BA 优化。
+			// 3 最终从 BA 获得 transform（通常精度更高）
 			std::multimap<int, int> words;
 			std::vector<cv::Point3f> words3DMap;
 			std::vector<cv::KeyPoint> wordsMap;
 			cv::Mat wordsDescriptorsMap;
 
 			const std::multimap<int, Link> & links = fromS.getLinks();
+			// 起始点 3d word点收集
 			if(!fromS.getWords3().empty())
 			{
 				const std::map<int, int> & wordsFrom = uMultimapToMapUnique(fromS.getWords());
@@ -3009,6 +3069,8 @@ Transform Memory::computeTransform(
 			}
 			UDEBUG("words3DMap=%d", (int)words3DMap.size());
 
+			// 起始点相关的邻接点的 3d work点收集。
+			// 即要求获取从起始点开始沿途所有的3d work点
 			for(std::multimap<int, Link>::const_iterator iter=links.begin(); iter!=links.end(); ++iter)
 			{
 				int id = iter->first;
@@ -3038,26 +3100,34 @@ Transform Memory::computeTransform(
 			Signature tmpFrom2(fromS.id());
 			tmpFrom2.setWords(words, wordsMap, words3DMap, wordsDescriptorsMap);
 
+			// 使用 registration pipeline 匹配计算变换
+			// 这个函数是 RegistrationPipeline（视觉 + 深度 + 激光 + 用户）统一的入口。
+			// 根据初始化时不同的_registrationPipeline进行不同的处理方式（视觉特征匹配或ICP），最终得到两者之间的变换
 			transform = _registrationPipeline->computeTransformationMod(tmpFrom2, tmpTo, guess, info);
 
+			// computeTransformationMod 前面已经粗略求得一个闭环变换 transform。这里要用所有邻居节点的图像特征进行一次真正的几何优化，提升闭环质量。
 			if(!transform.isNull() && info && !tmpFrom2.getWords3().empty())
 			{
+				// 如果它有效且 from 节点有 3D 特征点（words3）：需要BA，对当前节点周围邻居 + 闭环节点做局部 bundle adjustment（BA）优化闭环变换。
+				// 提取 from 节点的所有 3D 特征点
 				std::map<int, cv::Point3f> points3DMap;
 				std::map<int, int> wordsMap = uMultimapToMapUnique(tmpFrom2.getWords());
 				for(std::map<int, int>::iterator iter=wordsMap.begin(); iter!=wordsMap.end(); ++iter)
 				{
 					points3DMap.insert(std::make_pair(iter->first, tmpFrom2.getWords3()[iter->second]));
 				}
-				std::map<int, Transform> bundlePoses;
-				std::multimap<int, Link> bundleLinks;
-				std::map<int, std::vector<CameraModel> > bundleModels;
-				std::map<int, std::map<int, FeatureBA> > wordReferences;
 
+				// 构建 BA 的“局部节点集合”
 				std::multimap<int, Link> links = fromS.getLinks();
 				links = graph::filterLinks(links, Link::kNeighbor, true); // assemble only neighbors for the local feature map
 				links.insert(std::make_pair(toS.id(), Link(fromS.id(), toS.id(), Link::kGlobalClosure, transform, info->covariance.inv())));
 				links.insert(std::make_pair(fromS.id(), Link()));
 
+				// 构建 bundlePoses（初始节点位姿）
+				std::map<int, Transform> bundlePoses;  // BA要优化这些位姿
+				std::multimap<int, Link> bundleLinks;
+				std::map<int, std::vector<CameraModel> > bundleModels;  // 相机模型
+				std::map<int, std::map<int, FeatureBA> > wordReferences;  // <wordID, <nodeID, FeatureBA>> FeatureBA包含keypoint,depth,相机模型
 				int totalWordReferences = 0;
 				for(std::multimap<int, Link>::iterator iter=links.begin(); iter!=links.end(); ++iter)
 				{
@@ -3087,6 +3157,7 @@ Transform Memory::computeTransform(
 								{
 									CameraModel model = s->sensorData().stereoCameraModels()[i].left();
 									// Set Tx for stereo BA
+									// 相机模型
 									model = CameraModel(model.fx(),
 											model.fy(),
 											model.cx(),
@@ -3107,6 +3178,7 @@ Transform Memory::computeTransform(
 							if(iter->second.transform().isNull())
 							{
 								// fromId pose
+								// from节点固定
 								bundlePoses.insert(std::make_pair(id, Transform::getIdentity()));
 							}
 							else
@@ -3115,6 +3187,7 @@ Transform Memory::computeTransform(
 								bundlePoses.insert(std::make_pair(id, iter->second.transform()));
 							}
 
+							// 构建 wordReferences（2D 观测）
 							const std::map<int,int> & words = uMultimapToMapUnique(s->getWords());
 							for(std::map<int, int>::const_iterator jter=words.begin(); jter!=words.end(); ++jter)
 							{
@@ -3141,6 +3214,7 @@ Transform Memory::computeTransform(
 										d = util3d::transformPoint(s->getWords3()[jter->second], invLocalTransform).z;
 									}
 									wordReferences.insert(std::make_pair(jter->first, std::map<int, FeatureBA>()));
+									// jter->first(wordId) 这个 3D 点被 id(nodeId) 这个相机从以下像素位置看到：keypoint.pt
 									wordReferences.at(jter->first).insert(std::make_pair(id, FeatureBA(kpts, d, cv::Mat(), cameraIndex)));
 									++totalWordReferences;
 								}
@@ -3149,24 +3223,29 @@ Transform Memory::computeTransform(
 					}
 				}
 
-
+				// 调用 g2o 执行 BA 优化
 				UDEBUG("sba...start");
 				// set root negative to fix all other poses
+				// root节点id为负数时表示固定位姿
 				std::set<int> sbaOutliers;
 				UTimer bundleTimer;
 				OptimizerG2O sba(parameters_);
 				sba.setIterations(5);
 				UTimer bundleTime;
+				// 固定toS节点位姿，完成BA优化，得到优化后的结果
 				bundlePoses = sba.optimizeBA(-toS.id(), bundlePoses, bundleLinks, bundleModels, points3DMap, wordReferences, &sbaOutliers);
 				UDEBUG("sba...end");
 
 				UDEBUG("bundleTime=%fs (poses=%d wordRef=%d outliers=%d)", bundleTime.ticks(), (int)bundlePoses.size(), totalWordReferences, (int)sbaOutliers.size());
 
 				UDEBUG("Local Bundle Adjustment Before: %s", transform.prettyPrint().c_str());
+				// 处理 BA 的异常值（剔除不好的特征匹配）
 				if(!bundlePoses.rbegin()->second.isNull())
 				{
+					// 如果部分 2D-3D 匹配误差太大：
 					if(sbaOutliers.size())
 					{
+						// 需要更新 inlier 数量：
 						std::vector<int> newInliers(info->inliersIDs.size());
 						int oi=0;
 						for(unsigned int i=0; i<info->inliersIDs.size(); ++i)
@@ -3181,6 +3260,7 @@ Transform Memory::computeTransform(
 						info->inliers = (int)newInliers.size();
 						info->inliersIDs = newInliers;
 					}
+					// 如果 inlier 数太少，闭环被拒绝：
 					if(info->inliers < _registrationPipeline->getMinVisualCorrespondences())
 					{
 						info->rejectedMsg = uFormat("Too low inliers after bundle adjustment: %d<%d", info->inliers, _registrationPipeline->getMinVisualCorrespondences());
@@ -3188,9 +3268,11 @@ Transform Memory::computeTransform(
 					}
 					else
 					{
+						// 最终变换从 bundlePoses 中读取（优化后的闭环变换）
 						transform = bundlePoses.rbegin()->second;
 						if(_registrationPipeline->force3DoF())
 						{
+							// 最终闭环变换不是原来视觉/ICP 求出的，而是 BA 优化后的结果！
 							transform = transform.to3DoF();
 						}
 					}
@@ -3200,8 +3282,10 @@ Transform Memory::computeTransform(
 		}
 		else
 		{
+			// 如果没有 BA（更常见）：正常 registration pipeline 计算
 			transform = _registrationPipeline->computeTransformationMod(tmpFrom, tmpTo, guess, info);
 		}
+		// 如果 invertedReg 打开，则对 transform 反向
 		if(_invertedReg && !transform.isNull())
 		{
 			transform = transform.inverse();
@@ -3216,6 +3300,7 @@ Transform Memory::computeTransform(
 		}
 		UWARN(msg.c_str());
 	}
+	// 返回最终 from → to 的 6DoF 变换
 	return transform;
 }
 
@@ -3519,23 +3604,34 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 	return true;
 }
 
+/**
+ * 更新两个节点（signature）之间的 Link（约束），同时保持 from → to 和 to → from 的双向一致性，并根据需要更新缓存或数据库。
+ */
 void Memory::updateLink(const Link & link, bool updateInDatabase)
 {
+	// 从内存中取出两个节点（signatures）
+	// 如果返回非空说明这个节点在 Working Memory 或 Short-Term Memory 中；否则可能不在缓存只能在数据库里处理。
 	Signature * fromS = this->_getSignature(link.from());
 	Signature * toS = this->_getSignature(link.to());
 
 	if(fromS && toS)
 	{
+		// 情况一：两端节点都在内存中
+		// 检查两边确实原本互相有链接（双向一致）否则报错。
 		if(fromS->hasLink(link.to()) && toS->hasLink(link.from()))
 		{
+			// 获取旧 Link 的类型
 			Link::Type oldType = fromS->getLinks().find(link.to())->second.type();
 
+			// 删除旧的 link
 			fromS->removeLink(link.to());
 			toS->removeLink(link.from());
 
+			// 添加新的 link（保持双向）
 			fromS->addLink(link);
 			toS->addLink(link.inverse());
 
+			// 标记链接发生变化（除非都是虚拟闭环）
 			if(oldType!=Link::kVirtualClosure || link.type()!=Link::kVirtualClosure)
 			{
 				_linksChanged = true;
@@ -3548,6 +3644,8 @@ void Memory::updateLink(const Link & link, bool updateInDatabase)
 	}
 	else if(!updateInDatabase)
 	{
+		// 情况二：节点不在内存，且不允许更新数据库
+		// 只能报错，因为内存中没有并且不能写入数据库。
 		if(!fromS)
 		{
 			UERROR("from=%d, to=%d, Signature %d not found in working/st memories", link.from(), link.to(), link.from());
@@ -3559,21 +3657,27 @@ void Memory::updateLink(const Link & link, bool updateInDatabase)
 	}
 	else if(fromS)
 	{
+		// 情况三：只有 fromS 在内存中; toS节点不在内存（只在数据库 DB 中）
 		UDEBUG("Update link between %d and %d (db)", link.from(), link.to());
-		fromS->removeLink(link.to());
+		// 只更新 fromS 的本地 link，并把 inverse 写入数据库。
+		fromS->removeLink(link.to()); // 删除 fromS 内存中的旧 link
 		fromS->addLink(link);
 		_dbDriver->updateLink(link.inverse());
 	}
 	else if(toS)
 	{
+		// 情况四：只有 toS 在内存中
 		UDEBUG("Update link between %d (db) and %d", link.from(), link.to());
+		// 只更新 toS 的本地 link，并把正向 link 写入数据库。
 		toS->removeLink(link.from());
 		toS->addLink(link.inverse());
 		_dbDriver->updateLink(link);
 	}
 	else
 	{
+		// 情况五：两个节点都不在内存中
 		UDEBUG("Update link between %d (db) and %d (db)", link.from(), link.to());
+		// 完全靠数据库更新。
 		_dbDriver->updateLink(link);
 		_dbDriver->updateLink(link.inverse());
 	}

@@ -360,6 +360,8 @@ Transform RegistrationVis::computeTransformationImpl(
 
 	////////////////////
 	// Find correspondences
+	// 提取/获取 words（Keypoints + Descriptors）
+	// 建立视觉 Correspondences, 通常是：ORB descriptor matching → 拒绝错误匹配（RANSAC）\得到 2D-3D 或 3D-3D 对应
 	////////////////////
 	//recompute correspondences if descriptors are provided
 	if((fromSignature.getWordsDescriptors().empty() && toSignature.getWordsDescriptors().empty()) &&
@@ -402,10 +404,12 @@ Transform RegistrationVis::computeTransformationImpl(
 
 		std::vector<int> orignalWordsFromIds;
 		int kptsFromSource = 0;
+		// 开始提取keypoints
 		if(fromSignature.getWords().empty())
 		{
 			if(fromSignature.sensorData().keypoints().empty())
 			{
+				// 如果keypoints为空，通过计算获取keypoints
 				if(!imageFrom.empty())
 				{
 					if(imageFrom.channels() > 1)
@@ -452,6 +456,7 @@ Transform RegistrationVis::computeTransformationImpl(
 						}
 					}
 
+					// 计算得到keypoints
 					kptsFrom = _detectorFrom->generateKeypoints(
 							imageFrom,
 							depthMask);
@@ -459,6 +464,7 @@ Transform RegistrationVis::computeTransformationImpl(
 			}
 			else
 			{
+				// 如果keypoints不为空，直接返回即可
 				kptsFrom = fromSignature.sensorData().keypoints();
 				kptsFromSource = 1;
 			}
@@ -470,7 +476,9 @@ Transform RegistrationVis::computeTransformationImpl(
 			int i=0;
 			bool allUniques = true;
 			int previousIdAdded = 0;
+			// 根据起始节点获取keypoints
 			kptsFrom = fromSignature.getWordsKpts();
+			// 根据当前起始节点更新orignalWordsFromIds
 			for(std::multimap<int, int>::const_iterator iter=fromSignature.getWords().begin(); iter!=fromSignature.getWords().end(); ++iter)
 			{
 				UASSERT(iter->second>=0 && iter->second<(int)orignalWordsFromIds.size());
@@ -489,6 +497,7 @@ Transform RegistrationVis::computeTransformationImpl(
 			}
 		}
 
+		// 开始提取描述子
 		std::multimap<int, int> wordsFrom;
 		std::multimap<int, int> wordsTo;
 		std::vector<cv::KeyPoint> wordsKptsFrom;
@@ -1564,6 +1573,7 @@ Transform RegistrationVis::computeTransformationImpl(
 
 	/////////////////////
 	// Motion estimation
+	// 使用 PnP 或 3D motion estimation
 	/////////////////////
 	Transform transform;
 	cv::Mat covariance = cv::Mat::eye(6,6,CV_64FC1);

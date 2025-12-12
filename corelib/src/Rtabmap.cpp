@@ -318,49 +318,78 @@ void Rtabmap::flushStatisticLogs()
 	}
 }
 
+/**
+ * 这个初始化函数主要做以下几件事：
+ * 1 确定数据库路径与是否创建新数据库 
+ * 2 根据是否加载数据库参数，合并配置参数 
+ * 3 创建 Memory 对象并加载数据库内容（优化后的位姿图等）
+ * 4 解析参数，初始化内部变量 
+ * 5 从数据库中恢复 SLAM 状态（优化图、约束、全局地图等） 
+ * 6 初始化回环检测的贝叶斯预测模型 
+ * 7 创建全局激光地图（可选）
+ * 8 初始化日志系统
+ */
 void Rtabmap::init(const ParametersMap & parameters, const std::string & databasePath, bool loadDatabaseParameters)
 {
+	// 1. 打开/检查数据库路径
 	UDEBUG("path=%s", databasePath.c_str());
+	// 保存数据库路径
 	_databasePath = databasePath;
 	if(!_databasePath.empty())
 	{
+		// 如果路径不为空，则必须是 .db 后缀，否则断言失败：
 		UASSERT(UFile::getExtension(_databasePath).compare("db") == 0);
 		UINFO("Using database \"%s\".", _databasePath.c_str());
 	}
 	else
 	{
+		// 如果未提供数据库路径，则警告：
+		// 意味着：如果用 RAM 数据库，除非 close() 时指定新的输出路径，否则所有地图不会保存。
 		UWARN("Using empty database. Mapping session will not be saved unless it is closed with an output database path.");
 	}
 
+	// 2. 判断是否是新数据库
 	bool newDatabase = _databasePath.empty() || !UFile::exists(_databasePath);
 
+	// 3. 处理参数来源（程序参数 + 数据库参数）
 	ParametersMap allParameters;
 	if(!newDatabase && loadDatabaseParameters)
 	{
+		// 如果 [不是新数据库] 且 [要求加载数据库参数]：
 		DBDriver * driver = DBDriver::create();
 		if(driver->openConnection(_databasePath, false))
 		{
+			// 这些参数是之前 SLAM 运行时保存的。
 			allParameters = driver->getLastParameters();
 			// ignore working directory (we may be on a different computer)
+			// 特别地，删除工作目录参数（因为可能在另一电脑上运行）
 			allParameters.erase(Parameters::kRtabmapWorkingDirectory());
 		}
 		delete driver;
 	}
 
+	// 然后把用户传入参数 parameters 合并进来（覆盖数据库参数）
 	uInsert(allParameters, parameters);
 	ParametersMap::const_iterator iter;
+	// 4. 设置当前工作目录
 	if((iter=allParameters.find(Parameters::kRtabmapWorkingDirectory())) != allParameters.end())
 	{
 		this->setWorkingDirectory(iter->second.c_str());
 	}
 
 	// If doesn't exist, create a memory
+	// 5. 创建 Memory 对象（如果还没创建）
 	if(!_memory)
 	{
+		// Memory 负责：
+		// 1 读写数据库（节点、图片、词袋词典、约束等）
+		// 2 管理 STM/WM 
+		// 3 提供回环候选
 		_memory = new Memory(allParameters);
 		_memory->init(_databasePath, false, allParameters, true);
 	}
 
+	// 6. 清空与初始化内部运行数据
 	_optimizedPoses.clear();
 	_constraints.clear();
 	_globalScanMap.clear();
@@ -370,28 +399,44 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	_nodesToRepublish.clear();
 
 	// Parse all parameters
+	// 7. 解析参数并设置内部变量
+	// 这个函数会读所有 RTAB-Map 参数（如是否使用 ICP、最大距离、loop ratio 等）并设置内部变量。
 	this->parseParameters(allParameters);
 
+	// 8. 尝试从数据库中恢复优化后的位姿图
 	Transform lastPose;
+	// 由 loadOptimizedPoses(&lastPose) 填写，表示“最后的 localization pose”（通常是数据库里记录的最后一个定位位姿
 	_optimizedPoses = _memory->loadOptimizedPoses(&lastPose);
+	// 如果不是 增量式优化 Mem/IncrementalMemory 配置项
 	if(!_memory->isIncremental())
 	{
+		// 当初始化时没有现成的优化图但 WM 里有多个节点时，尝试基于这些节点计算一次优化图并得到约束，从而恢复出一个可用的地图状态。
 		if(_optimizedPoses.empty() &&
 			_memory->getWorkingMem().size()>1 &&
 			_memory->getWorkingMem().lower_bound(1)!=_memory->getWorkingMem().end())
 		{
 			cv::Mat cov;
+			// 尝试补算优化图：
+			// 第一个参数_optimizeFromGraphEnd：bool，决定在补算图时使用工作内存（WM）中的哪个节点作为起点（graph end 或 graph begin）。
+			// 第二个参数 false：代表 lookInDatabase=false（在 optimizeCurrentMap 的签名里，这通常表示不去数据库额外查找节点/约束，只使用内存内容或当前提供的数据进行优化）
+			// 第三个参数 _optimizedPoses：传出参数，用于接收优化结果（位姿 map）。
+			// cov：用于接收优化后的协方差矩阵（局部或全局）。
+			// &_constraints：将被填充为优化过程中或之后得到的约束集合（links）。
 			this->optimizeCurrentMap(
 					!_optimizeFromGraphEnd?_memory->getWorkingMem().lower_bound(1)->first:_memory->getWorkingMem().rbegin()->first,
 					false, _optimizedPoses, cov, &_constraints);
 		}
+		// 如果恢复出了优化图：
 		if(!_optimizedPoses.empty())
 		{
+			// 忽略数据库里记录的 “上次定位位姿”（可能来自不同实验/不同坐标系），而强制认为当前起点为地图原点（即第一个节点）。
+			// 常用于希望从头开始但使用已有地图的场景。
 			if(_restartAtOrigin)
 			{
 				UWARN("last localization pose is ignored (%s=true), assuming we start at the origin of the map.", Parameters::kRGBDStartAtOrigin().c_str());
 				lastPose = _optimizedPoses.begin()->second;
 			}
+			// 设置初始 localization pose（仅 localization 模式）
 			_lastLocalizationPose = lastPose;
 
 			UINFO("Loaded optimizedPoses=%d firstPose %d=%s lastLocalizationPose=%s",
@@ -400,27 +445,41 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 					_optimizedPoses.begin()->second.prettyPrint().c_str(),
 					_lastLocalizationPose.prettyPrint().c_str());
 
+			// 9. 如果没有约束信息，从 memory 里提取
 			if(_constraints.empty())
 			{
 				std::map<int, Transform> tmp;
 				// Get just the links
+				// 从 Memory 中重新获取约束
+				// uKeysSet 是一个帮助函数，返回 map 的 key 集合, 取出 _optimizedPoses 的节点 ID 集合作为请求对象
 				_memory->getMetricConstraints(uKeysSet(_optimizedPoses), tmp, _constraints, false, true);
 			}
 
 			// Initialize Bayes' prediction matrix
+			// 10. 初始化贝叶斯滤波器（回环检测预测模型）
 			UTimer time;
+			// 构建一个初始 likelihood(先验、似然) 分布：
 			std::map<int, float> likelihood;
+			// Memory::kIdVirtual：这是一个虚拟节点 ID，常用于贝叶斯滤波器中表示“未知/新地标”的概率；
+			// 将其初始值设为 1，代表默认把概率放在虚拟节点上（保证归一性或作为占位）。
 			likelihood.insert(std::make_pair(Memory::kIdVirtual, 1));
 			for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
 			{
+				// 对于_optimizedPoses中的每个节点
+				// 如果 Memory 中含有对应的 Signature（签名/描述子/图像等），则向 likelihood 中插入该节点并赋初值 0。
 				if(_memory->getSignature(iter->first))
 				{
 					likelihood.insert(std::make_pair(iter->first, 0));
 				}
 			}
+			// 用于回环检测：
+			// 贝叶斯滤波器根据传入的先验 likelihood 以及 Memory 中的统计信息来计算后验概率分布，
+			// 这个后验会被用于后续的 loop closure 候选筛选（即预测哪些节点更可能是回环匹配目标）。
 			_bayesFilter->computePosterior(_memory, likelihood);
 			UINFO("Time initializing Bayes' prediction with %ld nodes: %fs", _optimizedPoses.size(), time.ticks());
 
+			// 11. 创建全局激光地图（如果参数启用）
+			// 通常用于：多 session SLAM\位姿图全局一致性检查\导航地图构建
 			if(_createGlobalScanMap)
 				createGlobalScanMap();
 		}
@@ -431,9 +490,12 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	}
 	else
 	{
+		// 若 Memory 为增量式，那么 loadOptimizedPoses(&lastPose) 返回的结果通常已经是最新的优化图（或至少是增量维护的结果），
+		// 所以不需要再次调用 optimizeCurrentMap() 补算。
 		_lastLocalizationPose = lastPose;
 		if(!_optimizedPoses.empty())
 		{
+			// 如果 _optimizedPoses 非空而 _constraints 尚未填充，仍然调用 getMetricConstraints(...) 来确保约束信息就绪。
 			std::map<int, Transform> tmp;
 			// Get just the links
 			_memory->getMetricConstraints(uKeysSet(_optimizedPoses), tmp, _constraints, false, true);
@@ -444,6 +506,7 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	{
 		_statisticLogged = false;
 	}
+	// 12. 初始化日志文件系统
 	setupLogFiles(newDatabase);
 }
 
@@ -1182,6 +1245,7 @@ bool Rtabmap::process(
 		int id,
 		const std::map<std::string, float> & externalStats)
 {
+	// 调用主循环函数
 	return this->process(SensorData(image, id), Transform());
 }
 bool Rtabmap::process(
@@ -1197,6 +1261,7 @@ bool Rtabmap::process(
 		UASSERT(odomLinearVariance>0.0f);
 		UASSERT(odomAngularVariance>0.0f);
 	}
+	// 构造协方差矩阵
 	cv::Mat covariance = cv::Mat::eye(6,6,CV_64FC1);
 	covariance.at<double>(0,0) = odomLinearVariance;
 	covariance.at<double>(1,1) = odomLinearVariance;
@@ -1216,56 +1281,57 @@ bool Rtabmap::process(
 	UDEBUG("");
 
 	//============================================================
-	// Initialization
+	// Initialization 初始化
 	//============================================================
-	UTimer timer;
-	UTimer timerTotal;
-	double timeMemoryUpdate = 0;
-	double timeNeighborLinkRefining = 0;
-	double timeProximityByTimeDetection = 0;
-	double timeProximityBySpaceSearch = 0;
-	double timeProximityBySpaceVisualDetection = 0;
+	UTimer timer;  // 用于测量某一局部步骤的耗时（短时间段）
+	UTimer timerTotal;  // 测量整个 process() 的总耗时
+	double timeMemoryUpdate = 0;  // 更新记忆/图
+	double timeNeighborLinkRefining = 0;  // 邻接边修正
+	double timeProximityByTimeDetection = 0;  // 时间邻近检测
+	double timeProximityBySpaceSearch = 0;  // 空间邻近搜索（最近邻）
+	double timeProximityBySpaceVisualDetection = 0;  // 视觉靠近检测（回环）
 	double timeProximityBySpaceDetection = 0;
-	double timeCleaningNeighbors = 0;
+	double timeCleaningNeighbors = 0;  // 删除邻接边
 	double timeReactivations = 0;
-	double timeAddLoopClosureLink = 0;
-	double timeMapOptimization = 0;
-	double timeRetrievalDbAccess = 0;
-	double timeLikelihoodCalculation = 0;
-	double timePosteriorCalculation = 0;
-	double timeHypothesesCreation = 0;
-	double timeHypothesesValidation = 0;
-	double timeRealTimeLimitReachedProcess = 0;
-	double timeMemoryCleanup = 0;
-	double timeEmptyingTrash = 0;
-	double timeFinalizingStatistics = 0;
+	double timeAddLoopClosureLink = 0;  // 建立回环闭环约束
+	double timeMapOptimization = 0;  // 图优化
+	double timeRetrievalDbAccess = 0;  // 从数据库检索候选节点
+	double timeLikelihoodCalculation = 0;  // 计算似然度
+	double timePosteriorCalculation = 0;  // 计算后验概率
+	double timeHypothesesCreation = 0;  // 产生回环假设
+	double timeHypothesesValidation = 0;  // 验证回环假设
+	double timeRealTimeLimitReachedProcess = 0;  // 实时限制检查
+	double timeMemoryCleanup = 0;  // 清理旧记忆
+	double timeEmptyingTrash = 0;  // 垃圾清除（删除节点/链接）
 	double timeJoiningTrash = 0;
+	double timeFinalizingStatistics = 0;  // 生成统计数据
 	double timeStatsCreation = 0;
 
-	float hypothesisRatio = 0.0f; // Only used for statistics
-	bool rejectedLoopClosure = false;
+	float hypothesisRatio = 0.0f; // Only used for statistics 候选回环的得分比率（用于判断是否有效）
+	bool rejectedLoopClosure = false;  // 是否拒绝本帧的回环检测结果
 
-	std::map<int, float> rawLikelihood;
-	std::map<int, float> adjustedLikelihood;
-	std::map<int, float> likelihood;
-	std::map<int, int> weights;
-	std::map<int, float> posterior;
-	std::list<std::pair<int, float> > reactivateHypotheses;
+	std::map<int, float> rawLikelihood;  // 原始似然 (从视觉词包匹配计算出)
+	std::map<int, float> adjustedLikelihood;  // 调整后的似然（根据策略校正）
+	std::map<int, float> likelihood;  // 最终用于 Bayes 计算的似然
+	std::map<int, int> weights;  // 匹配权重（反映匹配强度）
+	std::map<int, float> posterior;  // 后验概率：用于判断最可能的回环
+	std::list<std::pair<int, float> > reactivateHypotheses;  // RTAB-Map 会在适当时重新激活老节点（长期记忆 → 短期记忆）的候选列表。
 
-	std::map<int, int> childCount;
-	std::set<int> signaturesRetrieved;
-	int proximityDetectionsInTimeFound = 0;
+	std::map<int, int> childCount;  // 统计子节点数
+	std::set<int> signaturesRetrieved;  // 存储从数据库读取的 signature（节点）。
+	int proximityDetectionsInTimeFound = 0;  // 统计基于时间（而不是距离）检测到的“邻近候选”（如连贯帧间相似度）。
 
-	const Signature * signature = 0;
-	const Signature * sLoop = 0;
+	const Signature * signature = 0;  // 当前帧的 Signature
+	const Signature * sLoop = 0;  // 回环对应的 Signature（若检测到回环）
 
 	_loopClosureHypothesis = std::make_pair(0,0.0f);
-	std::pair<int, float> lastHighestHypothesis = _highestHypothesis;
-	_highestHypothesis = std::make_pair(0,0.0f);
+	std::pair<int, float> lastHighestHypothesis = _highestHypothesis;  // 上一帧的最高候选，用于比较稳定性
+	_highestHypothesis = std::make_pair(0,0.0f);  // 本次处理中的最高回环候选 (id, score)
 
-	std::set<int> immunizedLocations;
+	std::set<int> immunizedLocations;  // 在局部图优化或临近节点中，有些节点会“免疫”（不参与某些操作）以避免重复检测。
 
-	statistics_ = Statistics(); // reset
+	statistics_ = Statistics(); // reset 清空统计对象
+	// 将外部提供的统计信息 externalStats 写入其中
 	for(std::map<std::string, float>::const_iterator iter=externalStats.begin(); iter!=externalStats.end(); ++iter)
 	{
 		statistics_.addStatistic(iter->first, iter->second);
@@ -1276,6 +1342,7 @@ bool Rtabmap::process(
 	//============================================================
 	ULOGGER_INFO("getting data...");
 
+	// 开始计时
 	timer.start();
 	timerTotal.start();
 
@@ -1285,19 +1352,26 @@ bool Rtabmap::process(
 
 	//============================================================
 	// If RGBD SLAM is enabled, a pose must be set.
+	// RGBD模式，系统要求odometry输入
 	//============================================================
+	// rtabmap_odom生成odom数据。建图模式下必须有Odom数据；定位模式下可以没有odom数据（允许只获取map定位结果）
+	// 如果当前没有 odometry，系统会生成一个假 odomPose，并用该标记记录。
 	bool fakeOdom = false;
 	if(_rgbdSlamMode)
 	{
+		// 如果有 odometry，则检查并修正
 		if(!odomPose.isNull())
 		{
 			// If we are doing 2D mapping, make sure the pose is 3DoF so that landmark logic works.
+			// 若强制 3DoF odom 且 Optimizer 是 2D SLAM 。如果odom不是三维，需要降维至 3DoF
 			if(_forceOdom3doF && _graphOptimizer->isSlam2d() && !odomPose.is3DoF())
 			{
 				odomPose = odomPose.to3DoF();
 			}
 
 			// this will make sure that all inverse operations will work!
+			// 检查 odometry 是否可逆（矩阵是否奇异）
+			// RTAB-Map 进行大量 pose.inverse() 操作; 奇异矩阵将导致 SLAM 崩溃
 			if(!odomPose.isInvertible())
 			{
 				UWARN("Input odometry is not invertible! pose = %s\n"
@@ -1310,7 +1384,9 @@ bool Rtabmap::process(
 						odomPose.r11(), odomPose.r12(), odomPose.r13(), odomPose.o14(),
 						odomPose.r21(), odomPose.r22(), odomPose.r23(), odomPose.o24(),
 						odomPose.r31(), odomPose.r32(), odomPose.r33(), odomPose.o34());
+				// 尝试进行旋转矩阵正交化（normalizeRotation）
 				odomPose.normalizeRotation();
+				// 若仍然不可逆，报 fatal 错误
 				UASSERT_MSG(odomPose.isInvertible(), uFormat("Odometry pose is not invertible!\n"
 						"[%f %f %f %f;\n"
 						" %f %f %f %f;\n"
@@ -1348,9 +1424,14 @@ bool Rtabmap::process(
 			_lastLocalizationNodeId == 0)
 		{
 			// Localization mode
-			if(!_optimizeFromGraphEnd)
+			// 进入Localization模式（不是 SLAM 建图，而是使用已有地图进行定位）。
+			// 此时系统必须建立：map->odom 之间的转换，使实时 odom 坐标与已优化地图坐标对齐。
+			if(!_optimizeFromGraphEnd)  // odom和map的对齐策略
 			{
-				//set map->odom so that odom is moved back to last saved localization
+				// _optimizeFromGraphEnd=false 不从图末端优化（默认）
+				// set map->odom so that odom is moved back to last saved localization
+				// 计算并设置 map->odom，以便将 odom 与新的定位结果对齐。
+				// 使用矩阵计算 _mapCorrection 结构为[R|T] R旋转 T平移
 				if(_graphOptimizer->isSlam2d())
 				{
 					_mapCorrection = _lastLocalizationPose.to3DoF() * odomPose.to3DoF().inverse();
@@ -1363,6 +1444,7 @@ bool Rtabmap::process(
 				{
 					_mapCorrection = _lastLocalizationPose * odomPose.inverse();
 				}
+				// 不从图末端优化，因此只需记录map->odom而不需要对优化后的位姿进行处理
 				std::map<int, Transform> nodesOnly(_optimizedPoses.lower_bound(1), _optimizedPoses.end());
 				_lastLocalizationNodeId = graph::findNearestNode(nodesOnly, _lastLocalizationPose);
 				UWARN("Update map correction based on last localization saved in database! correction = %s, nearest id = %d of last pose = %s, odom = %s",
@@ -1373,7 +1455,10 @@ bool Rtabmap::process(
 			}
 			else
 			{
-				//move optimized poses accordingly to last saved localization
+				// 从图末端优化
+				// move optimized poses accordingly to last saved localization
+				// 将整个 optimized map 根据新的本地化位置做平移
+				// odom = mapCorrectionInv * lastLocalizationPose 将新的map位姿转换到odom下，而不是调整 map→odom
 				Transform mapCorrectionInv;
 				if(_graphOptimizer->isSlam2d())
 				{
@@ -1387,6 +1472,7 @@ bool Rtabmap::process(
 				{
 					mapCorrectionInv = odomPose * _lastLocalizationPose.inverse();
 				}
+				// 从图末端优化，因此需要将优化后的map位姿转换到最新的odom坐标系下
 				for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
 				{
 					iter->second = mapCorrectionInv * iter->second;
@@ -1401,16 +1487,19 @@ bool Rtabmap::process(
 			}
 		}
 
+		// 若没有odometry
 		if(odomPose.isNull())
 		{
 			if(_memory->isIncremental())
 			{
+				// 建图模式 (incremental = true) 没有 odom → 无法继续 → 丢弃帧
 				UERROR("RGB-D SLAM mode is enabled, memory is incremental but no odometry is provided. "
 					   "Image %d is ignored!", data.id());
 				return false;
 			}
 			else // fake localization
 			{
+				// 定位模式 (incremental = false) 可用 mapCorrection 和 lastLocalizationPose 生成假 odom
 				if(!_mapCorrectionBackup.isNull())
 				{
 					_mapCorrection = _mapCorrectionBackup;
@@ -1429,12 +1518,14 @@ bool Rtabmap::process(
 		}
 		else if(_memory->isIncremental()) // only in mapping mode
 		{
+			// 建图模式下：检测 odometry 是否重置
 			// Detect if the odometry is reset. If yes, trigger a new map.
 			if(_memory->getLastWorkingSignature())
 			{
 				const Transform & lastPose = _memory->getLastWorkingSignature()->getPose(); // use raw odometry
 
 				// look for identity
+				// odom pose 突然变回 identity（0,0,0）常见于 VIO/VO 失败后的重置。
 				if(!lastPose.isIdentity() && odomPose.isIdentity())
 				{
 					int mapId = triggerNewMap();
@@ -1446,8 +1537,10 @@ bool Rtabmap::process(
 					Transform lastPoseToNewPose = lastPose.inverse() * odomPose;
 					float x,y,z, roll,pitch,yaw;
 					lastPoseToNewPose.getTranslationAndEulerAngles(x,y,z, roll,pitch,yaw);
+					// odometry 跳变过大判断（超过 _newMapOdomChangeDistance）
 					if((x*x + y*y + z*z) > _newMapOdomChangeDistance*_newMapOdomChangeDistance)
 					{
+						// 如果跳变过大，新建地图，用于避免因跳变导致图拓扑断裂。
 						int mapId = triggerNewMap();
 						UWARN("Odometry is reset (large odometry change detected > %f). A new map (%d) is created! Last pose = %s, new pose = %s",
 								_newMapOdomChangeDistance,
@@ -1462,10 +1555,16 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Memory Update : Location creation + Add to STM + Weight Update (Rehearsal)
+	// 更新memory: 定位创建 + 加入短期记忆 + 权重更新
 	//============================================================
 	ULOGGER_INFO("Updating memory...");
 	if(_rgbdSlamMode)
 	{
+		// 用 odometry 更新 Memory
+		// 传感器数据 → Memory.update() → Signature → 回环检测 → 图优化 → 地图输出
+		// update() 决定了：1当前节点是否要加入图 2当前节点是否要与旧节点匹配（回环检测入口）
+		// 3 odom pose 是否正确 4 特征提取是否成功 5 数据是否要压缩/保存 6 是否要产生新的回环候选
+		// 没有 Memory update，后续所有 SLAM 步骤没有输入。
 		if(!_memory->update(data, odomPose, odomCovariance, odomVelocity, &statistics_))
 		{
 			return false;
@@ -1473,13 +1572,16 @@ bool Rtabmap::process(
 	}
 	else
 	{
+		// 在非 RGBD-SLAM 模式下：使用空的 odometry 表示无 odom
 		if(!_memory->update(data, Transform(), cv::Mat(), std::vector<float>(), &statistics_))
 		{
 			return false;
 		}
 	}
 
+	// 获取最新的“工作签名”
 	signature = _memory->getLastWorkingSignature();
+	// 检测是否存在 GPS 信息
 	_currentSessionHasGPS = _currentSessionHasGPS || signature->sensorData().gps().stamp() > 0.0;
 	if(!signature)
 	{
@@ -1487,30 +1589,37 @@ bool Rtabmap::process(
 	}
 
 	ULOGGER_INFO("Processing signature %d w=%d map=%d", signature->id(), signature->getWeight(), signature->mapId());
+	// 记录 Memory update 的计算时间
 	timeMemoryUpdate = timer.ticks();
 	ULOGGER_INFO("timeMemoryUpdate=%fs", timeMemoryUpdate);
 
 	//============================================================
 	// Metric
+	// RGBD模式下：运动检测、小位移过滤、速度过滤、邻居链路优化（Odometry refining）、图优化、姿态更新、landmark 管理、约束图更新、里程管理。
 	//============================================================
-	bool smallDisplacement = false;
-	bool tooFastMovement = false;
-	std::list<int> signaturesRemoved;
-	bool neighborLinkRefined = false;
-	bool addedNewLandmark = false;
-	float distanceToClosestNodeInTheGraph = 0;
-	float angleToClosestNodeInTheGraph = 0;
+	// 1. 变量初始化
+	bool smallDisplacement = false;  // 机器人移动太小
+	bool tooFastMovement = false;  // 机器人移动太快
+	std::list<int> signaturesRemoved;  // 被删除节点
+	bool neighborLinkRefined = false;   // 是否执行了 ICP refine
+	bool addedNewLandmark = false;  // 新增 landmark
+	float distanceToClosestNodeInTheGraph = 0;  // 最近关键帧距离
+	float angleToClosestNodeInTheGraph = 0;  // 最近关键帧角度差
 	if(_rgbdSlamMode)
 	{
+		// 2. 处理 odometry 协方差
 		double linVar = odomCovariance.empty()?1.0f:uMax3(odomCovariance.at<double>(0,0), odomCovariance.at<double>(1,1)>=9999?0:odomCovariance.at<double>(1,1), odomCovariance.at<double>(2,2)>=9999?0:odomCovariance.at<double>(2,2));
 		double angVar = odomCovariance.empty()?1.0f:uMax3(odomCovariance.at<double>(3,3)>=9999?0:odomCovariance.at<double>(3,3), odomCovariance.at<double>(4,4)>=9999?0:odomCovariance.at<double>(4,4), odomCovariance.at<double>(5,5));
 		statistics_.addStatistic(Statistics::kMemoryOdometry_variance_lin(), (float)linVar);
 		statistics_.addStatistic(Statistics::kMemoryOdometry_variance_ang(), (float)angVar);
 
 		//Verify if there was a rehearsal
+		// rehearsal 检查（节点是否与上一帧合并）'MemoryRehearsal/merged'
 		int rehearsedId = (int)uValue(statistics_.data(), Statistics::kMemoryRehearsal_merged(), 0.0f);
 		if(rehearsedId > 0)
 		{
+			// 如果两帧太相似，则不创建新节点，而是合并。
+			// 这时旧节点的 optimized pose 要清除。
 			_optimizedPoses.erase(rehearsedId);
 		}
 		else
@@ -1519,6 +1628,7 @@ bool Rtabmap::process(
 			{
 				//============================================================
 				// Minimum displacement required to add to Memory
+				// 运动过滤：是否是“小位移”帧, 若机器人根本没动多少，则该帧不会加入图结构。
 				//============================================================
 				Transform t;
 
@@ -1532,16 +1642,19 @@ bool Rtabmap::process(
 						// don't filter if the new node is not intermediate but previous one is
 						if(signature->getWeight() < 0 || s->getWeight() >= 0)
 						{
+							// 获取当前节点与第一帧的转换
 							t = links.begin()->second.transform();
 						}
 					}
 				}
 				else if(!_odomCachePoses.empty())
 				{
+					// 从缓存中获取第一帧与当前节点的转换
 					t = _odomCachePoses.rbegin()->second.inverse() * signature->getPose();
 				}
 				if(!t.isNull())
 				{
+					// 如果变换 t 很小
 					float x,y,z, roll,pitch,yaw;
 					t.getTranslationAndEulerAngles(x,y,z, roll,pitch,yaw);
 					bool isMoving = fabs(x) > _rgbdLinearUpdate ||
@@ -1555,6 +1668,7 @@ bool Rtabmap::process(
 					{
 						// This will disable global loop closure detection, only retrieval will be done.
 						// The location will also be deleted at the end.
+						// 不进行全局回环检测; 该节点最终会被移除; 只进行外观检索（retrieval）
 						smallDisplacement = true;
 						UDEBUG("smallDisplacement: %f %f %f %f %f %f", x,y,z, roll,pitch,yaw);
 					}
@@ -1564,6 +1678,8 @@ bool Rtabmap::process(
 			{
 				// This will disable global loop closure detection, only retrieval will be done.
 				// The location will also be deleted at the end.
+				// 速度太快意味着：视觉特征失效; ICP 可能失败; 回环检测不可靠
+				// 速度过快过滤: 禁止执行 neighbor link refining（ICP）; 该帧只用于外观检索，不加入图优化
 				tooFastMovement =
 						(_rgbdLinearSpeedUpdate>0.0f && uMax3(fabs(odomVelocity[0]), fabs(odomVelocity[1]), fabs(odomVelocity[2])) > _rgbdLinearSpeedUpdate) ||
 						(_rgbdAngularSpeedUpdate>0.0f && uMax3(fabs(odomVelocity[3]), fabs(odomVelocity[4]), fabs(odomVelocity[5])) > _rgbdAngularSpeedUpdate);
@@ -1571,28 +1687,31 @@ bool Rtabmap::process(
 		}
 
 		// Update optimizedPoses with the newly added node
+		// 邻居链路优化 Neighbor Link Refining（最关键）
 		Transform newPose;
 		bool intermediateNodeRefining = false;
 		if(_neighborLinkRefining &&
 			signature->getLinks().size() &&
 			signature->getLinks().begin()->second.type() == Link::kNeighbor &&
-		   _memory->isIncremental() && // ignore pose matching in localization mode
-		   rehearsedId == 0 && // don't do it if rehearsal happened
-		   !tooFastMovement) // ignore if too fast movement has been detected
+		   _memory->isIncremental() && // ignore pose matching in localization mode 定位模式不执行
+		   rehearsedId == 0 && // don't do it if rehearsal happened 没有 rehearsal
+		   !tooFastMovement) // ignore if too fast movement has been detected 没有 tooFastMovement
 		{
 			int oldId = signature->getLinks().begin()->first;
 			const Signature * oldS = _memory->getSignature(oldId);
 			UASSERT(oldS != 0);
 
-			if(signature->getWeight() >= 0 && oldS->getWeight()>=0) // ignore intermediate nodes
+			if(signature->getWeight() >= 0 && oldS->getWeight()>=0) // 忽略非关键节点
 			{
+				// link 表示 A→B，那我们求逆得到 B→A 的初步估计（guess）
 				Transform guess = signature->getLinks().begin()->second.transform().inverse();
 
-				if(smallDisplacement)
+				if(smallDisplacement)  // 微小移动时
 				{
 					if(signature->getLinks().begin()->second.transVariance() == 1)
 					{
 						// set small variance
+						// 设置很大的协方差 → 表示该测量不可靠
 						UDEBUG("Set small variance. The robot is not moving.");
 						_memory->updateLink(Link(oldId, signature->id(), signature->getLinks().begin()->second.type(), guess, cv::Mat::eye(6,6,CV_64FC1)*1000));
 					}
@@ -1601,12 +1720,15 @@ bool Rtabmap::process(
 				{
 					//============================================================
 					// Refine neighbor links
+					// 执行 ICP refine（核心）
 					//============================================================
 					UINFO("Odometry refining: guess = %s", guess.prettyPrint().c_str());
+					// 使用特征匹配＋ICP 计算 refined transform
 					RegistrationInfo info;
 					Transform t = _memory->computeTransform(oldId, signature->id(), guess, &info);
 					if(!t.isNull())
 					{
+						// 计算成功将邻近边添加到memory中
 						UINFO("Odometry refining: update neighbor link (%d->%d, variance:lin=%f, ang=%f) from %s to %s",
 								oldId,
 								signature->id(),
@@ -1622,6 +1744,7 @@ bool Rtabmap::process(
 							// update all previous nodes
 							// Normally _mapCorrection should be identity, but if _optimizeFromGraphEnd
 							// parameters just changed state, we should put back all poses without map correction.
+							// 
 							Transform u = guess * t.inverse();
 							std::map<int, Transform>::iterator jter = _optimizedPoses.find(oldId);
 							UASSERT(jter!=_optimizedPoses.end());
@@ -1635,6 +1758,7 @@ bool Rtabmap::process(
 					}
 					else
 					{
+						// 计算失败设置很大的协方差
 						UINFO("Odometry refining rejected: %s", info.rejectedMsg.c_str());
 						if(!info.covariance.empty() && info.covariance.at<double>(0,0) > 0.0 && info.covariance.at<double>(0,0) != 1.0 && info.covariance.at<double>(5,5) > 0.0 && info.covariance.at<double>(5,5) != 1.0)
 						{
@@ -1654,14 +1778,17 @@ bool Rtabmap::process(
 					statistics_.addStatistic(Statistics::kNeighborLinkRefiningICP_complexity(), info.icpStructuralComplexity);
 					statistics_.addStatistic(Statistics::kNeighborLinkRefiningPts(), signature->sensorData().laserScanRaw().size());
 				}
+				// ICP耗时计算
 				timeNeighborLinkRefining = timer.ticks();
 				ULOGGER_INFO("timeOdometryRefining=%fs", timeNeighborLinkRefining);
 
 				UASSERT(oldS->hasLink(signature->id()));
 				UASSERT(uContains(_optimizedPoses, oldId));
 
+				// 统计信息记录
 				statistics_.addStatistic(Statistics::kNeighborLinkRefiningVariance(), oldS->getLinks().find(signature->id())->second.transVariance());
 
+				// 更新 optimizedPoses（图优化后的位姿）
 				newPose = _optimizedPoses.at(oldId) * oldS->getLinks().find(signature->id())->second.transform();
 				_mapCorrection = newPose * signature->getPose().inverse();
 				if(_mapCorrection.getNormSquared() > 0.001f && _optimizeFromGraphEnd)
@@ -1684,6 +1811,7 @@ bool Rtabmap::process(
 		}
 
 		// Get statistics about the closest node in the graph
+		// 定位模式下，找到地图上最靠近当前位置的节点
 		if(!_memory->isIncremental())
 		{
 			int closestNode = 0;
@@ -1707,9 +1835,11 @@ bool Rtabmap::process(
 
 		UDEBUG("Added pose %s (odom=%s)", newPose.prettyPrint().c_str(), signature->getPose().prettyPrint().c_str());
 		// Update Poses and Constraints
+		// 添加 Landmarks（AprilTags、特征点地图等）约束
 		_optimizedPoses.insert(std::make_pair(signature->id(), newPose));
 		if(_memory->isIncremental() && signature->getWeight() >= 0)
 		{
+			// 建图模式下添加landmark 约束
 			for(std::map<int, Link>::const_iterator iter = signature->getLandmarks().begin(); iter!=signature->getLandmarks().end(); ++iter)
 			{
 				if(_optimizedPoses.find(iter->first) == _optimizedPoses.end())
@@ -1725,6 +1855,7 @@ bool Rtabmap::process(
 		float distanceTravelledOld = _distanceTravelled;
 
 		// only in mapping mode we add a neighbor link
+		// 更新 graph constraints（图边）
 		if(signature->getLinks().size() &&
 		   signature->getLinks().begin()->second.type() == Link::kNeighbor)
 		{
@@ -1732,6 +1863,7 @@ bool Rtabmap::process(
 			UASSERT_MSG(signature->id() > signature->getLinks().begin()->second.to(),
 					"Only forward links should be added.");
 
+			// 从 signature 的第一个 Link 中取出它的逆向 Link，并存到 tmp。
 			Link tmp = signature->getLinks().begin()->second.inverse();
 
 			if(!smallDisplacement)
@@ -1740,6 +1872,7 @@ bool Rtabmap::process(
 			}
 
 			// if the previous node is an intermediate node, remove it from the local graph
+			// 如果前一个节点是 intermediate（非关键节点）：合并中间节点 删除中间节点 图拓扑简化
 			if(_constraints.size() &&
 			   _constraints.rbegin()->second.to() == signature->getLinks().begin()->second.to())
 			{
@@ -1788,22 +1921,26 @@ bool Rtabmap::process(
 			}
 		}
 		_lastLocalizationPose = newPose; // keep in cache the latest corrected pose
+		// Localization 模式相关缓存
 		if(!_memory->isIncremental() && signature->getWeight() >= 0)
 		{
 			UDEBUG("Update odometry localization cache (size=%d/%d)", (int)_odomCachePoses.size(), _maxOdomCacheSize);
 			if(!_odomCachePoses.empty())
 			{
+				// 更新里程
 				float odomDistance = (_odomCachePoses.rbegin()->second.inverse() * signature->getPose()).getNorm();
 				if(!smallDisplacement)
 				{
 					_distanceTravelled += odomDistance;
 				}
 
+				// 限制缓存大小,过大清除最早的缓存
 				while(!_odomCachePoses.empty() && (int)_odomCachePoses.size() > _maxOdomCacheSize)
 				{
 					_odomCacheConstraints.erase(_odomCachePoses.begin()->first);
 					_odomCachePoses.erase(_odomCachePoses.begin());
 				}
+				// 缓存 constraints
 				if(!_odomCachePoses.empty())
 				{
 					Link odomLink(_odomCachePoses.rbegin()->first,
@@ -1816,18 +1953,28 @@ bool Rtabmap::process(
 				}
 			}
 
+			// 缓存 odometry poses
 			_odomCachePoses.insert(std::make_pair(signature->id(), signature->getPose()));
 		}
+		// 里程累加
 		_distanceTravelledSinceLastLocalization += _distanceTravelled - distanceTravelledOld;
 
 		//============================================================
 		// Reduced graph
 		//============================================================
 		//Verify if there are nodes that were merged through graph reduction
+		// 这段代码做了三件事：
+		// 1 更新路径中节点的 ID（因为有些 ID 被替换成回环闭合后的新 ID）
+		// 2 删除已经被替换掉的旧 ID 对应的位姿 
+		// 3 删除与这些旧 ID 有关的约束（Links）
+		// 这样保证优化后的图（poses + constraints + path）保持一致性。
 		if(statistics_.reducedIds().size())
 		{
+			// 确认 reducedIds 是否非空
+			// 如果存在 ID 映射，则需要对路径、位姿、约束进行更新。
 			for(unsigned int i=0; i<_path.size(); ++i)
 			{
+				// 更新路径 _path 中的节点 ID
 				std::map<int, int>::const_iterator iter = statistics_.reducedIds().find(_path[i].first);
 				if(iter!= statistics_.reducedIds().end())
 				{
@@ -1836,6 +1983,7 @@ bool Rtabmap::process(
 				}
 			}
 
+			// 处理被移除的原始 ID：删除其位姿和相关约束
 			for(std::map<int, int>::const_iterator iter=statistics_.reducedIds().begin();
 				iter!=statistics_.reducedIds().end();
 				++iter)
@@ -1860,15 +2008,26 @@ bool Rtabmap::process(
 
 		//============================================================
 		// Local loop closure in TIME
+		// RTAB-Map 中 local loop closure（局部回环）检测逻辑
+		// 当前节点与时间上相邻的节点足够接近时，尝试计算两者的相对变换，如果成功则添加一个“局部时间回环（local time closure）”约束。
 		//============================================================
+		// _proximityByTime = true → 开启“基于时间的邻近回环” 
+		// intermediateNodeRefining = true → 中间节点需要优化，也会触发类似逻辑
 		if((_proximityByTime || intermediateNodeRefining) &&
-		   rehearsedId == 0 && // don't do it if rehearsal happened
-		   _memory->isIncremental() && // don't do it in localization mode
-		   signature->getWeight()>=0)
+		   rehearsedId == 0 && // 如果当前节点是“复习节点（rehearsed）”就跳过（因为它已经与其他节点强关联过）。
+		   _memory->isIncremental() && // 必须是 SLAM 模式，不能是只定位模式
+		   signature->getWeight()>=0) // 权重小于 0 的节点一般不参与图优化，如虚拟节点／无效节点。
 		{
 			const std::set<int> & stm = _memory->getStMem();
+			// 遍历 STM（短期记忆）中的节点
 			for(std::set<int>::const_reverse_iterator iter = stm.rbegin(); iter!=stm.rend(); ++iter)
 			{
+				// 筛选可用于做局部回环的 target 节点
+				// 必须满足： 
+				// 1 不是当前节点本身 
+				// 2 当前节点与该节点之间还没有 Link（避免重复添加） 
+				// 3 两者属于同一个地图（mapId） 
+				// 4 权重有效
 				if(*iter != signature->id() &&
 				   signature->getLinks().find(*iter) == signature->getLinks().end() &&
 				   _memory->getSignature(*iter)->mapId() == signature->mapId() &&
@@ -1878,14 +2037,17 @@ bool Rtabmap::process(
 					UDEBUG("Check local transform between %d and %d", signature->id(), *iter);
 					RegistrationInfo info;
 					Transform guess;
+					// 计算两节点之间的相对位姿 transform
 					if(_optimizedPoses.find(*iter) != _optimizedPoses.end())
 					{
 						guess = _optimizedPoses.at(*iter).inverse() * newPose;
 					}
 
 					// For proximity by time, correspondences should be already enough precise, so don't recompute them
+					// 使用视觉或匹配方法计算 transform
 					Transform transform = _memory->computeTransform(*iter, signature->id(), guess, &info, true);
 
+					// 若成功返回非空 transform，就认为找到局部时间回环。
 					if(!transform.isNull())
 					{
 						transform = transform.inverse();
@@ -1894,6 +2056,7 @@ bool Rtabmap::process(
 								*iter,
 								transform.prettyPrint().c_str());
 						// Add a loop constraint
+						// 回环成功：添加一个类型为 kLocalTimeClosure（局部时间回环） 的边
 						UASSERT(info.covariance.at<double>(0,0) > 0.0 && info.covariance.at<double>(5,5) > 0.0);
 						if(_memory->addLink(Link(signature->id(), *iter, Link::kLocalTimeClosure, transform, getInformation(info.covariance))))
 						{
@@ -1913,6 +2076,8 @@ bool Rtabmap::process(
 								*iter, signature->id(), rejectedMsg.c_str());
 					}
 
+					// 特殊逻辑：只对第一个非中间节点执行
+					// 如果只是为了中间节点细化，并非 proximity-by-time，则找到第一个匹配对象后就停止
 					if(!_proximityByTime && intermediateNodeRefining)
 					{
 						// Do it only with the latest non-intermediate node
@@ -1928,10 +2093,14 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Bayes filter update
+	// 这段代码是 RTAB-Map 中最核心的部分之一：似然计算 + Bayes 过滤 + 回环（loop closure）假设选择与验证。
 	//============================================================
+	// 判断 上一次更新是否发生过定位回环
 	bool localizationOnPreviousUpdate = false;
 	if(_memory->isIncremental())
 	{
+		// SLAM模式 如果上一帧有过 loop closure： 
+		// 当前 signature 有 link , link 指向别的节点 , 该节点存在 loop closure links → 则认为“上一帧发生过定位回环”
 		localizationOnPreviousUpdate =
 			signature->getLinks().size() &&
 			signature->getLinks().begin()->first!=signature->id() &&
@@ -1940,8 +2109,9 @@ bool Rtabmap::process(
 	else
 	{
 		// localization mode
-
 		// Count how many localization links are in the constraints
+
+		// Localization 模式 遍历 odomCacheConstraints，看是否存在超过 1 个定位相关的边（为了过滤延迟检测）。
 		int localizationLinks = 0;
 		int previousIdWithLocalizationLink = 0;
 		for(std::multimap<int, Link>::iterator iter=_odomCacheConstraints.begin();
@@ -1968,23 +2138,28 @@ bool Rtabmap::process(
 	}
 
 	// Not a bad signature, not an intermediate node, not a small displacement unless the previous signature didn't have a loop closure, not too fast movement
+	// 判断是否允许进行回环检测,要求：图像质量足够 & 不是中间节点、虚拟节点 & 不小位移 或 上一帧没有定位回环 & 不是太快移动
 	if(!signature->isBadSignature() && signature->getWeight()>=0 && (!smallDisplacement || !localizationOnPreviousUpdate) && !tooFastMovement)
 	{
 		// If the working memory is empty, don't do the detection. It happens when it
 		// is the first time the detector is started (there needs some images to
 		// fill the short-time memory before a signature is added to the working memory).
+		// 必须 Working Memory 非空 第一次启动时，WM 未满 → 不做回环
 		if(_memory->getWorkingMem().size())
 		{
 			//============================================================
 			// Likelihood computation
 			// Get the likelihood of the new signature
 			// with all images contained in the working memory + reactivated.
+			// 计算似然用的候选节点（signaturesToCompare）
 			//============================================================
 			ULOGGER_INFO("computing likelihood...");
 
 			std::list<int> signaturesToCompare;
 			GPS originGPS;
 			Transform originOffsetENU = Transform::getIdentity();
+			// 如果启用 GPS，则需要从 GPS 坐标进行过滤
+			// 计算当前节点的 ENU 坐标 & 为工作记忆中每个节点计算 ENU 坐标 & 根据 GPS 距离过滤掉太远的节点
 			if(_loopGPS)
 			{
 				originGPS = signature->sensorData().gps();
@@ -2020,6 +2195,7 @@ bool Rtabmap::process(
 				}
 			}
 
+			// 过滤，加入 signaturesToCompare
 			for(std::map<int, double>::const_iterator iter=_memory->getWorkingMem().begin();
 				iter!=_memory->getWorkingMem().end();
 				++iter)
@@ -2091,9 +2267,12 @@ bool Rtabmap::process(
 				}
 			}
 
+			// Likelihood（似然）计算
+			// 这是 RTAB-Map 的核心：使用 Bag-of-Words / visual features & 对新节点与所有候选节点计算匹配得分（似然）
 			rawLikelihood = _memory->computeLikelihood(signature, signaturesToCompare);
 
 			// Adjust the likelihood (with mean and std dev)
+			// 再做标准化（adjustLikelihood）
 			likelihood = rawLikelihood;
 			this->adjustLikelihood(likelihood);
 
@@ -2102,7 +2281,8 @@ bool Rtabmap::process(
 
 			//============================================================
 			// Apply the Bayes filter
-			//  Posterior = Likelihood x Prior
+			//  Posterior = Likelihood x Prior 其中 Prior 是时间相关的转移概率（Markov chain）
+			// Bayes Filter：后验计算
 			//============================================================
 			ULOGGER_INFO("getting posterior...");
 
@@ -2119,6 +2299,7 @@ bool Rtabmap::process(
 
 			//============================================================
 			// Select the highest hypothesis
+			// 从 posterior 中选出最高假设
 			//============================================================
 			ULOGGER_INFO("creating hypotheses...");
 			if(posterior.size())
@@ -2131,6 +2312,7 @@ bool Rtabmap::process(
 					}
 				}
 				// With the virtual place, use sum of LC probabilities (1 - virtual place hypothesis).
+				// 把“虚拟场所”的概率减掉
 				_highestHypothesis.second = 1-posterior.begin()->second;
 			}
 			timeHypothesesCreation = timer.ticks();
@@ -2138,8 +2320,10 @@ bool Rtabmap::process(
 
 			if(_highestHypothesis.first > 0)
 			{
+				// 综合计算阈值
 				float loopThr = _loopThr;
 				bool hasLoopClosureConstraints = false;
+				// 判断是否存在回环约束
 				for(std::multimap<int, Link>::iterator iter=_odomCacheConstraints.begin(); iter!=_odomCacheConstraints.end() && !hasLoopClosureConstraints; ++iter)
 				{
 					hasLoopClosureConstraints =
@@ -2159,16 +2343,19 @@ bool Rtabmap::process(
 				}
 
 				// Loop closure Threshold
+				// 验证回环假设
 				if(_highestHypothesis.second >= loopThr)
 				{
 					rejectedLoopClosure = true;
 					if(posterior.size() <= 2 && loopThr>0.0f)
 					{
 						// Ignore loop closure if there is only one loop closure hypothesis
+						// 只有一个闭环假设，过于单一 → 可能属于自相似 → 拒绝
 						UDEBUG("rejected hypothesis: single hypothesis");
 					}
 					else if(_verifyLoopClosureHypothesis && !_epipolarGeometry->check(signature, _memory->getSignature(_highestHypothesis.first)))
 					{
+						// 极线几何检查（Epipolar Geometry）
 						UWARN("rejected hypothesis: by epipolar geometry");
 					}
 					else if(_loopRatio > 0.0f && lastHighestHypothesis.second && _highestHypothesis.second < _loopRatio*lastHighestHypothesis.second)
@@ -2182,7 +2369,9 @@ bool Rtabmap::process(
 					}
 					else
 					{
+						// 储存当前最好的闭环匹配节点 ID + posterior 评分
 						_loopClosureHypothesis = _highestHypothesis;
+						// 通过验证
 						rejectedLoopClosure = false;
 					}
 
@@ -2215,16 +2404,26 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Before retrieval, make sure the trash has finished
+	// 在进行“检索或回环检测”之前，确保内存垃圾（trash memory）已经清理完毕。
 	//============================================================
+	// 阻塞等待后台“垃圾处理线程”完成
 	_memory->joinTrashThread();
+	// 获取垃圾线程中真正用于数据库保存（写入磁盘）的时间
 	timeEmptyingTrash = _memory->getDbSavingTime();
+	// 记录主线程“等待 trashThread 的实际开销”
 	timeJoiningTrash = timer.ticks();
 	ULOGGER_INFO("Time emptying memory trash = %fs,  joining (actual overhead) = %fs", timeEmptyingTrash, timeJoiningTrash);
 
 	//============================================================
 	// RETRIEVAL 1/3 : Loop closure neighbors reactivation
+	// 当检测到回环候选节点后，从数据库或长期记忆中重新激活该节点周围的邻居节点，并进行免疫（防止它们被转移到长期内存）
+	// 目标： 1 找到回环候选节点的邻居（时间邻居 + 空间邻居）
+	// 2 重新加载必要的节点到 Working Memory（WM）
+	// 3 给这些节点加“免疫标记”（immunization），使它们不会被 Memory Management 从 WM 中移除
+	// 4 后续步骤（Retrieval 2/3 与 3/3）才能顺利进行视觉回环验证与图优化
 	//============================================================
-	int retrievalId = _highestHypothesis.first;
+	// 基本变量与内存管理检查
+	int retrievalId = _highestHypothesis.first;  // 当前回环假设的节点 ID（由 Bayes 计算出的最佳候选）
 	std::list<int> reactivatedIds;
 	double timeGetNeighborsTimeDb = 0.0;
 	double timeGetNeighborsSpaceDb = 0.0;
@@ -2238,6 +2437,8 @@ bool Rtabmap::process(
 	}
 	// no need to do retrieval or immunization of locations if memory management
 	// is disabled and all nodes are in WM
+	// 判断是否需要 retrieval（重新激活）
+	// 只有在：WM 不是满载所有节点 或 memory management 启用 才需要 retrieval。
 	if(!(_memory->allNodesInWM() && maxLocalLocationsImmunized == 0))
 	{
 		if(retrievalId > 0)
@@ -2256,6 +2457,7 @@ bool Rtabmap::process(
 
 			// priority in time
 			// Direct neighbors TIME
+			// 获取“时间邻居” TIME 邻居 = 连续的 Odom chain（比如：ID 300 → 301 → 302 → …）
 			ULOGGER_DEBUG("In TIME");
 			neighbors = _memory->getNeighborsId(retrievalId,
 					neighborhoodSize,
@@ -2268,6 +2470,9 @@ bool Rtabmap::process(
 					&timeGetNeighborsTimeDb);
 			ULOGGER_DEBUG("neighbors of %d in time = %d", retrievalId, (int)neighbors.size());
 			//Priority to locations near in time (direct neighbor) then by space (loop closure)
+			// 排序与处理 TIME 邻居
+			// 作用： 1 按 m 分层处理（由近到远）2 避免加载短期记忆（STM）中的节点（因为它们已经在内存中）
+			// 3 记录被重新激活的 ID 4 记录被免疫的 ID
 			bool firstPassDone = false; // just to avoid checking to STM after the first pass
 			int m = 0;
 			while(m < neighborhoodSize)
@@ -2312,6 +2517,7 @@ bool Rtabmap::process(
 			}
 
 			// neighbors SPACE, already added direct neighbors will be ignored
+			// 获取“空间邻居”（Loop closure neighbors） SPACE 邻居 = 通过 loop closure 连接的节点
 			ULOGGER_DEBUG("In SPACE");
 			neighbors = _memory->getNeighborsId(retrievalId,
 					neighborhoodSize,
@@ -2358,6 +2564,7 @@ bool Rtabmap::process(
 				reactivatedIds.insert(reactivatedIds.end(), idsSorted.rbegin(), idsSorted.rend());
 				++m;
 			}
+			// 最终打印状态
 			ULOGGER_INFO("neighborhoodSize=%d, "
 					"reactivatedIds.size=%d, "
 					"nbLoadedFromDb=%d, "
@@ -2376,18 +2583,22 @@ bool Rtabmap::process(
 
 	//============================================================
 	// RETRIEVAL 2/3 : Update planned path and get next nodes to retrieve
+	// 在局部范围内优先保持或加载与当前位姿相关的关键帧，尤其是路径上的关键帧与最近邻关键帧。
 	//============================================================
 	std::list<int> retrievalLocalIds;
 	if(_rgbdSlamMode)
 	{
 		// Priority on locations on the planned path
+		// 依据当前路径（_path）加载或免疫节点
 		if(_path.size())
 		{
+			// 先更新当前路径索引 会更新机器人当前在路径上的位置。
 			updateGoalIndex();
 
 			float distanceSoFar = 0.0f;
 			// immunize all nodes after current node and
 			// retrieve nodes after current node in the maximum radius from the current node
+			// 沿路径向前累积距离，找到局部半径 _localRadius 内的路径节点
 			for(unsigned int i=_pathCurrentIndex; i<_path.size(); ++i)
 			{
 				if(_localRadius > 0.0f && i != _pathCurrentIndex)
@@ -2395,6 +2606,9 @@ bool Rtabmap::process(
 					distanceSoFar += _path[i-1].second.getDistance(_path[i].second);
 				}
 
+				// 如果距离 ≤ _localRadius： 
+				// 若该节点已在 WM 中 → 免疫该节点 
+				// 若该节点未在 WM 中 → 加入重新加载列表 retrievalLocalIds
 				if(distanceSoFar <= _localRadius)
 				{
 					if(_memory->getSignature(_path[i].first) != 0)
@@ -2424,6 +2638,7 @@ bool Rtabmap::process(
 		if(!(_memory->allNodesInWM() && maxLocalLocationsImmunized == 0))
 		{
 			// immunize the path from the nearest local location to the current location
+			// 免疫当前节点到最近局部节点之间的路径
 			if(immunizedLocally < maxLocalLocationsImmunized &&
 				_memory->isIncremental()) // Can only work in mapping mode
 			{
@@ -2436,6 +2651,8 @@ bool Rtabmap::process(
 						poses.insert(*iter);
 					}
 				}
+				
+				// 找出距离当前节点最近的“局部”节点
 				int nearestId = graph::findNearestNode(poses, _optimizedPoses.at(signature->id()));
 
 				if(nearestId > 0 &&
@@ -2452,6 +2669,7 @@ bool Rtabmap::process(
 						}
 					}
 
+					// 如果 nearestId 在局部范围内，计算二者间路径
 					std::list<std::pair<int, Transform> > path = graph::computePath(_optimizedPoses, links, nearestId, signature->id());
 					if(path.size() == 0)
 					{
@@ -2459,6 +2677,7 @@ bool Rtabmap::process(
 					}
 					else
 					{
+						// 沿路径免疫节点，直到达到最大允许免疫数量 maxLocalLocationsImmunized
 						for(std::list<std::pair<int, Transform> >::iterator iter=path.begin();
 							iter!=path.end();
 							++iter)
@@ -2500,8 +2719,10 @@ bool Rtabmap::process(
 
 			// retrieval based on the nodes close the the nearest pose in WM
 			// immunize closest nodes
+			// 基于最近邻节点进行检索和免疫
 			std::map<int, float> nearNodes = graph::findNearestNodes(signature->id(), _optimizedPoses, _localRadius);
 			// sort by distance
+			// 按距离排序。
 			std::multimap<float, int> nearNodesByDist;
 			for(std::map<int, float>::iterator iter=nearNodes.lower_bound(1); iter!=nearNodes.end(); ++iter)
 			{
@@ -2512,6 +2733,7 @@ bool Rtabmap::process(
 					maxLocalLocationsImmunized,
 					_localImmunizationRatio,
 					(int)_memory->getWorkingMem().size());
+			// 对邻节点进行检索和免疫，直到达到最大检索数量
 			for(std::multimap<float, int>::iterator iter=nearNodesByDist.begin();
 				iter!=nearNodesByDist.end() && (retrievalLocalIds.size() < _maxLocalRetrieved || immunizedLocally < maxLocalLocationsImmunized);
 				++iter)
@@ -2526,12 +2748,14 @@ bool Rtabmap::process(
 						jter!=links.rend() && retrievalLocalIds.size() < _maxLocalRetrieved;
 						++jter)
 					{
+						// 若某个节点的邻居未在 WM 中 → 加入检索列表
 						if(_memory->getSignature(jter->first) == 0)
 						{
 							UINFO("retrieval of node %d on local map", jter->first);
 							retrievalLocalIds.push_back(jter->first);
 						}
 					}
+					// 若该节点不在 STM 且仍需免疫 → 将其免疫
 					if(!_memory->isInSTM(s->id()) && immunizedLocally < maxLocalLocationsImmunized)
 					{
 						if(immunizedLocations.insert(s->id()).second)
@@ -2543,6 +2767,7 @@ bool Rtabmap::process(
 				}
 			}
 			// well, if the maximum retrieved is not reached, look for neighbors in database
+			// 如果未达到最大检索数量，再查数据库邻居
 			if(retrievalLocalIds.size() < _maxLocalRetrieved)
 			{
 				std::set<int> retrievalLocalIdsSet(retrievalLocalIds.begin(), retrievalLocalIds.end());
@@ -2550,6 +2775,7 @@ bool Rtabmap::process(
 					iter!=retrievalLocalIds.end() && retrievalLocalIds.size() < _maxLocalRetrieved;
 					++iter)
 				{
+					// 通过 memory->getNeighborsId 获取更远邻居
 					std::map<int, int> ids = _memory->getNeighborsId(*iter, 2, _maxLocalRetrieved - (unsigned int)retrievalLocalIds.size() + 1, true, false);
 					for(std::map<int, int>::reverse_iterator jter=ids.rbegin();
 						jter!=ids.rend() && retrievalLocalIds.size() < _maxLocalRetrieved;
@@ -2567,12 +2793,14 @@ bool Rtabmap::process(
 			}
 
 			// update Age of the close signatures (oldest the farthest)
+			// 更新这些局部节点的“年龄”
 			for(std::multimap<float, int>::reverse_iterator iter=nearNodesByDist.rbegin(); iter!=nearNodesByDist.rend(); ++iter)
 			{
 				_memory->updateAge(iter->second);
 			}
 
 			// insert them first to make sure they are loaded.
+			// 将 retrievalLocalIds 插入 reactivatedIds，确保这些节点优先被加载：
 			reactivatedIds.insert(reactivatedIds.begin(), retrievalLocalIds.begin(), retrievalLocalIds.end());
 		}
 	}
@@ -2584,6 +2812,7 @@ bool Rtabmap::process(
 	{
 		// Not important if the loop closure hypothesis don't have all its neighbors loaded,
 		// only a loop closure link is added...
+		// 1) 从数据库中重新激活（载入）那些标记为需要重新激活的 signature（节点/特征签名）
 		signaturesRetrieved = _memory->reactivateSignatures(
 				reactivatedIds,
 				_maxRetrieved+(unsigned int)retrievalLocalIds.size(), // add path retrieved
@@ -2591,12 +2820,16 @@ bool Rtabmap::process(
 
 		ULOGGER_INFO("retrieval of %d (db time = %fs)", (int)signaturesRetrieved.size(), timeRetrievalDbAccess);
 
+		// 2) 把另外两类与“获取邻居”相关的 DB 时间加到总的检索 DB 时间中
 		timeRetrievalDbAccess += timeGetNeighborsTimeDb + timeGetNeighborsSpaceDb;
 		UINFO("total timeRetrievalDbAccess=%fs", timeRetrievalDbAccess);
 
 		// Immunize just retrieved signatures
+		// 3) 将刚检索到的签名“免疫化”——防止它们被内存管理再次移出
 		immunizedLocations.insert(signaturesRetrieved.begin(), signaturesRetrieved.end());
 
+		// 4) 如果确实检索到了签名，并且全局扫描映射（global scan map）不为空，
+    	//    则清空全局扫描映射及其位姿。理由：全局扫描地图在重新引入节点后可能不一致。
 		if(!signaturesRetrieved.empty() && !_globalScanMap.empty())
 		{
 			UWARN("Some signatures have been retrieved from memory management, clearing global scan map...");
@@ -2609,8 +2842,10 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Proximity detections
+	// RTAB-Map 的局部空间回环检测
 	//============================================================
 	std::list<std::pair<int, int> > loopClosureLinksAdded;
+	// 统计视觉回环质量（inliers, variance, matches）
 	int loopClosureVisualInliers = 0; // for statistics
 	float loopClosureVisualInliersRatio = 0.0f;
 	int loopClosureVisualMatches = 0;
@@ -2620,6 +2855,7 @@ bool Rtabmap::process(
 	float loopClosureVisualInliersDistribution = 0;
 
 	int proximityDetectionsAddedVisually = 0;
+	// 统计 ICP 匹配添加的回环数量
 	int proximityDetectionsAddedByICPMulti = 0;
 	int proximityDetectionsAddedByICPGlobal = 0;
 	int lastProximitySpaceClosureId = 0;
@@ -2628,11 +2864,14 @@ bool Rtabmap::process(
 	int localScanPathsChecked = 0;
 	int loopIdSuppressedByProximity = 0;
 
+	// 是否允许空间近邻检测的条件检查
 	if(_proximityBySpace &&
 	   _localRadius > 0 &&
 	   _rgbdSlamMode &&
-	   signature->getWeight() >= 0) // not an intermediate node
+	   signature->getWeight() >= 0) // 要求不是中间节点
 	{
+		// 一些特殊情况禁止执行 proximity detection
+		// 1 当前 session 刚开始，还没有建立与旧地图的回环，不允许局部检测。
 		if(_startNewMapOnLoopClosure &&
 			_memory->getWorkingMem().size()>=2 && // must have an old map (+1 virtual place)
 			_localizationCovariance.empty() && // if we didn't localize yet
@@ -2642,10 +2881,12 @@ bool Rtabmap::process(
 					"closure with previous map before doing proximity detections (%s=true).",
 					Parameters::kRtabmapStartNewMapOnLoopClosure().c_str());
 		}
+		// 2 若图优化器被关闭（iterations()==0）
 		else if(_graphOptimizer->iterations() == 0)
 		{
 			UWARN("Cannot do local loop closure detection in space if graph optimization is disabled!");
 		}
+		// 3 运动太小或太快时跳过检测
 		else
 		{
 			// In localization mode, no need to check local loop
@@ -2653,24 +2894,30 @@ bool Rtabmap::process(
 
 			// don't do it if it is a small displacement unless the previous signature didn't have a loop closure
 			// don't do it if there is a too fast movement
+			// 移动速度适中并且（上一次更新没有发生定位回环或移动距离适中）
 			if((!smallDisplacement || !localizationOnPreviousUpdate) && !tooFastMovement)
 			{
 
 				//============================================================
 				// LOCAL LOOP CLOSURE SPACE
+				// 进入真正的局部回环检测流程
 				//============================================================
 
 				//
 				// 1) compare visually with nearest locations
+				// 阶段 1：视觉近邻检测
 				//
 				UDEBUG("Proximity detection (local loop closure in SPACE using matching images, local radius=%fm)", _localRadius);
+				// 寻找局部邻居节点，从 _optimizedPoses 中找出距离当前节点在 _localRadius 半径内的所有节点
+				// nearestIds 的 value 是距离或排序指标
 				std::map<int, float> nearestIds = graph::findNearestNodes(signature->id(), _optimizedPoses, _localRadius);
 				UDEBUG("nearestIds=%d/%d", (int)nearestIds.size(), (int)_optimizedPoses.size());
 				std::map<int, Transform> nearestPoses;
 				std::multimap<int, int> links;
+				// 受到 max depth 约束，则按图深度过滤
 				if(_memory->isIncremental() && _proximityMaxGraphDepth>0)
 				{
-					// get bidirectional links
+					// get bidirectional links 构建双向 links
 					for(std::multimap<int, Link>::iterator iter=_constraints.begin(); iter!=_constraints.end(); ++iter)
 					{
 						if(uContains(_optimizedPoses, iter->second.from()) && uContains(_optimizedPoses, iter->second.to()))
@@ -2680,6 +2927,7 @@ bool Rtabmap::process(
 						}
 					}
 				}
+				// 根据深度过滤 nearestIds，形成 nearestPoses。
 				for(std::map<int, float>::iterator iter=nearestIds.lower_bound(1); iter!=nearestIds.end(); ++iter)
 				{
 					if(_memory->getStMem().find(iter->first) == _memory->getStMem().end())
@@ -2702,9 +2950,11 @@ bool Rtabmap::process(
 				UDEBUG("nearestPoses=%d", (int)nearestPoses.size());
 
 				// segment poses by paths, only one detection per path, landmarks are ignored
+				// 对 nearby 节点根据路径分组
 				std::map<int, std::map<int, Transform> > nearestPathsNotSorted = getPaths(nearestPoses, _optimizedPoses.at(signature->id()), _proximityMaxGraphDepth);
 				UDEBUG("got %d paths", (int)nearestPathsNotSorted.size());
 				// sort nearest paths by highest likelihood (if two have same likelihood, sort by id)
+				// 按路径的 “最高似然” 排序
 				std::map<NearestPathKey, std::map<int, Transform> > nearestPaths;
 				Transform currentPoseInv = _optimizedPoses.at(signature->id()).inverse();
 				for(std::map<int, std::map<int, Transform> >::const_iterator iter=nearestPathsNotSorted.begin();iter!=nearestPathsNotSorted.end(); ++iter)
@@ -2736,6 +2986,7 @@ bool Rtabmap::process(
 				{
 					proximityFilteringRadius = _maxLoopClosureDistance;
 				}
+				// 对每条路径尝试视觉回环检测
 				for(std::map<NearestPathKey, std::map<int, Transform> >::const_reverse_iterator iter=nearestPaths.rbegin();
 					iter!=nearestPaths.rend() &&
 					(_proximityMaxPaths <= 0 || localVisualPathsChecked < _proximityMaxPaths);
@@ -2745,9 +2996,11 @@ bool Rtabmap::process(
 					UASSERT(path.size());
 
 					//find the nearest pose on the path looking in the same direction
+					// 找到这条路径上在同一方向上距离当前最近的节点
 					path.insert(std::make_pair(signature->id(), _optimizedPoses.at(signature->id())));
 					path = graph::findNearestPoses(signature->id(), path, _localRadius, _proximityAngle);
 					//take the one with highest likelihood if not null
+					// 找最近的候选节点 nearestId
 					int nearestId = 0;
 					if(iter->first.likelihood > 0.0f &&
 					   path.find(iter->first.id)!=path.end())
@@ -2762,6 +3015,7 @@ bool Rtabmap::process(
 					if(nearestId > 0)
 					{
 						// nearest pose must not be linked to current location and enough close
+						// 最近的候选节点 nearestId 未与当前节点建立链接，并且要求候选节点与当前节点距离足够近
 						if(!signature->hasLink(nearestId) &&
 							(proximityFilteringRadius <= 0.0f ||
 							 _optimizedPoses.at(signature->id()).getDistanceSquared(_optimizedPoses.at(nearestId)) < proximityFilteringRadius*proximityFilteringRadius))
@@ -2769,14 +3023,17 @@ bool Rtabmap::process(
 							++localVisualPathsChecked;
 							RegistrationInfo info;
 							Transform guess;
+							// 有 odom guess 则使用 odometry
 							if(_proximityOdomGuess)
 							{
 								// Use odometry as guess so that correspondences can be computed by projection
 								guess = _optimizedPoses.at(nearestId).inverse()*_optimizedPoses.at(signature->id());
 							} //else: guess is null to make sure visual correspondences are globally computed
+							// 通过视觉 computeTransform， transform = 从 nearestId → 当前节点 的位姿变换
 							Transform transform = _memory->computeTransform(nearestId, signature->id(), guess, &info);
 							if(!transform.isNull())
 							{
+								// 成功
 								transform = transform.inverse();
 								if(proximityFilteringRadius <= 0 || transform.getNormSquared() <= proximityFilteringRadius*proximityFilteringRadius)
 								{
@@ -2787,6 +3044,7 @@ bool Rtabmap::process(
 									UASSERT(info.covariance.at<double>(0,0) > 0.0 && info.covariance.at<double>(5,5) > 0.0);
 
 									//for statistics
+									// 记录数据
 									loopClosureVisualInliersMeanDist = info.inliersMeanDistance;
 									loopClosureVisualInliersDistribution = info.inliersDistribution;
 
@@ -2821,6 +3079,7 @@ bool Rtabmap::process(
 										}
 									}
 
+									// 会被加入图中作为 Link::kLocalSpaceClosure
 									_memory->addLink(Link(signature->id(), nearestId, type, transform, information));
 									loopClosureLinksAdded.push_back(std::make_pair(signature->id(), nearestId));
 								}
@@ -2849,12 +3108,14 @@ bool Rtabmap::process(
 
 				//
 				// 2) compare locally with nearest locations by scan matching
+				// 阶段 2：激光扫描近邻检测
 				//
 				UDEBUG("Proximity detection (local loop closure in SPACE with scan matching)");
 				if( _proximityMaxNeighbors <= 0)
 				{
 					UDEBUG("Proximity by scan matching is disabled (%s=%d).", Parameters::kRGBDProximityPathMaxNeighbors().c_str(), _proximityMaxNeighbors);
 				}
+				// 只有当前节点含激光数据时才进行
 				else if(!signature->sensorData().laserScanCompressed().isEmpty())
 				{
 					proximitySpacePaths = (int)nearestPaths.size();
@@ -2868,6 +3129,7 @@ bool Rtabmap::process(
 						UASSERT(path.begin()->first > 0);
 
 						//find the nearest pose on the path
+						// 查找路径中最近节点
 						int nearestId = rtabmap::graph::findNearestNode(path, _optimizedPoses.at(signature->id()));
 						UASSERT(nearestId > 0);
 						//UDEBUG("Path %d (size=%d) distance=%fm", nearestId, (int)path.size(), _optimizedPoses.at(signature->id()).getDistance(_optimizedPoses.at(nearestId)));
@@ -2883,6 +3145,8 @@ bool Rtabmap::process(
 								// "_proximityMaxNeighbors-1" means that if _proximityMaxNeighbors=1,
 								// only nearest node on the path is taken (no scan merging). Useful to find
 								// proximity detection between only 2 nodes with 360x360 lidar scans.
+								// 根据配置限制邻居数量（scan merging）
+								// 例如 _proximityMaxNeighbors = 1 表示不 merge 扫描，只匹配两个节点。
 								for(std::map<int, Transform>::iterator iter=nearestIdIter; iter!=path.end() && i<=_proximityMaxNeighbors-1; ++iter, ++i)
 								{
 									filteredPath.insert(*iter);
@@ -2896,6 +3160,7 @@ bool Rtabmap::process(
 							}
 
 							// Assemble scans in the path and do ICP only
+							// 使用局部地图执行 ICP 分两种模式
 							std::map<int, Transform> optimizedLocalPath;
 							if(_globalScanMap.empty() && _proximityRawPosesUsed)
 							{
@@ -2944,10 +3209,12 @@ bool Rtabmap::process(
 									RegistrationInfo info;
 									Transform transform;
 									bool icpMulti = true;
+									// Multi-ICP 模式（无 global scan map）
 									if(_globalScanMap.empty())
 									{
 										transform = _memory->computeIcpTransformMulti(signature->id(), nearestId, filteredPath, &info);
 									}
+									// Global scan map 模式（已有全局点云）
 									else
 									{
 										UASSERT_MSG(_globalScanMapPoses.find(nearestId) != _globalScanMapPoses.end(), uFormat("Pose of %d not found in global scan poses", nearestId).c_str());
@@ -2969,6 +3236,7 @@ bool Rtabmap::process(
 										}
 									}
 
+									// 成功后添加回环边
 									if(!transform.isNull())
 									{
 										UINFO("[Scan matching] Add local loop closure in SPACE (%d->%d) %s",
@@ -3040,17 +3308,25 @@ bool Rtabmap::process(
 	//=============================================================
 	// Global loop closure detection
 	// (updated: place this after retrieval to be sure that neighbors of the loop closure are in RAM)
+	// 全局回环检测
+	// 更新：将此操作放在检索之后，以确保闭环闭合的相邻元素位于 RAM 中。
 	//=============================================================
+	// 若存在回环候选（来自词袋）表示词袋候选（BOW matching）已经找到一个潜在回环节点 ID 为_loopClosureHypothesis.first
 	if(_loopClosureHypothesis.first>0)
 	{
+		// 若未被局部 proximity 检测抑制，才能执行全局回环
+		// 若上一阶段局部空间检测已经对该区域建立了回环，则避免重复计算全局回环。
 		if(loopIdSuppressedByProximity==0)
 		{
 			//Compute transform if metric data are present
+			// 计算全局回环变换（视觉匹配）
 			Transform transform;
 			RegistrationInfo info;
 			info.covariance = cv::Mat::eye(6,6,CV_64FC1);
 			if(_rgbdSlamMode)
 			{
+				// 从候选回环节点 → 当前节点；使用视觉特征匹配+RANSAC+PnP 或 DEPTH 方法
+				// 若 _loopClosureIdentityGuess 为 true，则使用单位变换作为初始猜测
 				transform = _memory->computeTransform(
 						_loopClosureHypothesis.first,
 						signature->id(),
@@ -3063,6 +3339,7 @@ bool Rtabmap::process(
 				loopClosureVisualInliers = info.inliers;
 				loopClosureVisualInliersRatio = info.inliersRatio;
 				loopClosureVisualMatches = info.matches;
+				// 处理视觉匹配结果
 				rejectedLoopClosure = transform.isNull();
 				if(rejectedLoopClosure)
 				{
@@ -3071,15 +3348,18 @@ bool Rtabmap::process(
 				}
 				else if(_maxLoopClosureDistance>0.0f && transform.getNorm() > _maxLoopClosureDistance)
 				{
+					// 若 transform 距离过大 → 拒绝
 					rejectedLoopClosure = true;
 					UWARN("Rejected localization %d -> %d because distance to map (%fm) is over %s=%fm.",
 							_loopClosureHypothesis.first, signature->id(), transform.getNorm(), Parameters::kRGBDMaxLoopClosureDistance().c_str(), _maxLoopClosureDistance);
 				}
 				else
 				{
+					// 若成功，则取 transform.inverse()
 					transform = transform.inverse();
 				}
 			}
+			// 若 transform 可用，添加全局回环边
 			if(!rejectedLoopClosure)
 			{
 				// Make the new one the parent of the old one
@@ -3095,6 +3375,7 @@ bool Rtabmap::process(
 				}
 			}
 
+			// 若任何错误发生 → 清除回环假设
 			if(rejectedLoopClosure)
 			{
 				_loopClosureHypothesis.first = 0;
@@ -3102,6 +3383,12 @@ bool Rtabmap::process(
 		}
 		else if(loopIdSuppressedByProximity != _loopClosureHypothesis.first)
 		{
+			// _loopClosureHypothesis.first 这是 词袋（BoW）全局回环检测 得到的候选节点 ID。表示 BoW 判断：当前节点可能与节点 150 是全局回环（视觉相似）。
+			// loopIdSuppressedByProximity这是 局部空间接近（proximity by space）检测 设置的一个“抑制 ID”。表示 proximity 检测已经处理过 ID 附近的区域，不需要再对它做全局回环。
+			// 这个被抑制的区域 不是当前候选的回环 ID 说明这是「另一个区域的抑制」，不属于当前候选
+			// RTAB-Map 的策略是：若当前 proximity 抑制不是针对这个候选回环节点，则认为当前这个候选也不安全，于是直接清除回环候选
+			// 因为 proximity 检测比 BoW 更可靠（基于几何/位姿/ICP）。
+			// RTAB-Map 的原则是：只要 proximity 检测正在影响地图中的某一区域，BoW 的全局回环就不要“越权”到其他区域乱匹配
 			_loopClosureHypothesis.first = 0;
 		}
 	}
@@ -3111,17 +3398,28 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Landmark
+	// Landmark（地标）检测与处理
+	// RTAB-Map 中 landmark（地标）是 非 SLAM 节点，通常是 ArUco 标签 / fiducial markers / AprilTag / QRCode / 手工地标。
+	// Landmark 形成图优化中的特殊节点（anchor node），由相机观测得到位置约束。
 	//============================================================
 	std::map<int, std::set<int> > landmarksDetected; // <Landmark ID, list of nodes that saw this landmark>
+	// 检测当前 signature 是否观测到地标
 	if(!signature->getLandmarks().empty() && !_graphOptimizer->landmarksIgnored())
 	{
+		// odom cache 中是否已经包含全局闭环？
 		bool hasGlobalLoopClosuresInOdomCache = !graph::filterLinks(_odomCacheConstraints, Link::kGlobalClosure, true).empty() || _loopClosureHypothesis.first != 0;
 		UDEBUG("hasGlobalLoopClosuresInOdomCache=%d", hasGlobalLoopClosuresInOdomCache?1:0);
+		// 遍历所有观测到的地标
 		for(std::map<int, Link>::const_iterator iter=signature->getLandmarks().begin(); iter!=signature->getLandmarks().end(); ++iter)
 		{
+			// 判断这个地标是否曾被看到超过一次
+			// 若该地标只出现过 1 次，则不能用于图优化（单点无法提供相对位姿）。
 			if(uContains(_memory->getLandmarksIndex(), iter->first) &&
 					_memory->getLandmarksIndex().find(iter->first)->second.size()>1)
 			{
+				// 判断是否允许在“定位模式”使用远距离地标
+				// 在 定位模式（memory incremental= false） 中：如果没有全局回环，里程计（odom）是漂移的，远距离 landmark 观测可能会导致地图错位
+				// 因此，如果 landmark 太远，则应忽略
 				if(!_memory->isIncremental() &&          // In localization mode
 					!hasGlobalLoopClosuresInOdomCache && // If there are global loop closures in odom cache, we can keep far landmarks
 					_localRadius>0.0 &&
@@ -3137,9 +3435,12 @@ bool Rtabmap::process(
 				}
 				else
 				{
+					// 接受这个地标观测
 					UINFO("Landmark %d observed again! Seen the first time by node %d.", -iter->first, *_memory->getLandmarksIndex().find(iter->first)->second.begin());
+					// 记录该地标再次被看到 （在 graph optimization 中使用）
 					landmarksDetected.insert(std::make_pair(iter->first, _memory->getLandmarksIndex().find(iter->first)->second));
 					rejectedLoopClosure = false; // If it was true, it will be set back to false if landmarks are rejected on graph optimization
+					// 将此 landmark 视为一个 loop closure（因为它将旧数据与当前节点连接）
 					loopClosureLinksAdded.push_back(std::make_pair(signature->id(), iter->first));
 				}
 			}
@@ -3148,21 +3449,28 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Add virtual links if a path is activated
+	// 虚拟闭环
+	// 这部分是 路径跟踪模式 / 导航模式（path following） 的专属逻辑。
 	//============================================================
+	// 若机器人正在执行路径（规划）：
 	if(_path.size())
 	{
 		// Add a virtual loop closure link to keep the path linked to local map
+		// 机器人当前位置并非路径上的当前目标节点 并且两者之间还没有图优化连接 则需要创建一个“虚拟闭环”。
 		if( signature->id() != _path[_pathCurrentIndex].first &&
 			!signature->hasLink(_path[_pathCurrentIndex].first))
 		{
 			UASSERT(uContains(_optimizedPoses, signature->id()));
 			UASSERT_MSG(uContains(_optimizedPoses, _path[_pathCurrentIndex].first), uFormat("id=%d", _path[_pathCurrentIndex].first).c_str());
+			// Virtual closure 是一种 弱约束(edge)：仅用于保持路径中的目标节点与图中当前节点连接 其约束权重（信息矩阵）非常小（方差很大）
+			// 计算虚拟闭环的 transform
 			Transform virtualLoop = _optimizedPoses.at(signature->id()).inverse() * _optimizedPoses.at(_path[_pathCurrentIndex].first);
 
 			if(_localRadius == 0.0f || virtualLoop.getNorm() < _localRadius)
 			{
 				_memory->addLink(Link(signature->id(), _path[_pathCurrentIndex].first, Link::kVirtualClosure, virtualLoop, cv::Mat::eye(6,6,CV_64FC1)*0.01)); // set high variance
 			}
+			// 若虚拟闭环太远（违反 localRadius），则中止路径执行
 			else
 			{
 				UERROR("Virtual link larger than local radius (%fm > %fm). Aborting the plan!",
@@ -3174,7 +3482,9 @@ bool Rtabmap::process(
 
 	//============================================================
 	// Optimize map graph
+	// 图优化
 	//============================================================
+	// 阶段 0 — 变量/统计初始化
 	float maxLinearError = 0.0f;
 	float maxLinearErrorRatio = 0.0f;
 	float maxAngularError = 0.0f;
@@ -3197,29 +3507,35 @@ bool Rtabmap::process(
 	UDEBUG("Retrieved: %d", (int)signaturesRetrieved.size());
 	UDEBUG("Not self ref links: %d", (int)graph::filterLinks(signature->getLinks(), Link::kSelfRefLink).size());
 
-	if(_rgbdSlamMode
+	// 阶段 1 — 决策：是否要做图优化
+	if(_rgbdSlamMode // 仅在 RGB-D SLAM 模式时才做
 		&&
-		(_loopClosureHypothesis.first>0 ||
+		(_loopClosureHypothesis.first>0 || // 词袋找到 global loop
 	     lastProximitySpaceClosureId>0 || // can be different map of the current one
 	     statistics_.reducedIds().size() ||
-		 (signature->hasLink(signature->id(), Link::kPosePrior) && !_graphOptimizer->priorsIgnored()) || // prior edge
+		 (signature->hasLink(signature->id(), Link::kPosePrior) && !_graphOptimizer->priorsIgnored()) || // prior/gravity 链增加先验信息
 		 (signature->hasLink(signature->id(), Link::kGravity) && _graphOptimizer->gravitySigma()>0.0f && (!_memory->isOdomGravityUsed() || neighborLinkRefined)) || // gravity edge
-	     proximityDetectionsInTimeFound>0 ||
-		 !landmarksDetected.empty() ||
-		 signaturesRetrieved.size()) // can be different map of the current one
+	     proximityDetectionsInTimeFound>0 || // 时间邻近的 proximity
+		 !landmarksDetected.empty() || // 地标
+		 signaturesRetrieved.size()) // 被检索回的签名（从数据库回来）会影响图,可以是不同地图的节点
 		 &&
 		 (_memory->isIncremental() ||
 		  // In localization mode, the new node should be linked to another node or a landmark already in the working memory
+		  // 若处于 localization 模式，只有当该新节点与工作内存已有连接（virtual link or landmark）时才继续。
+		  // 也就是：定位模式下不随意对全图做优化，只有当新节点能连接到 working memory 才会调整。
 		  graph::filterLinks(graph::filterLinks(signature->getLinks(), Link::kVirtualClosure), Link::kSelfRefLink).size() ||
 		  !landmarksDetected.empty()))
 	{
 		UASSERT(uContains(_optimizedPoses, signature->id()));
 
 		//used in localization mode: filter virtual links
+		// 在 localization 模式下，构建 localizationLinks 并检查其是否都在 graph 中，目的是找出“可用于定位/约束当前节点的外部链接集合”。
+		// localizationLinks 包含虚拟闭环（path linking）并且排除了 self-ref links
 		std::multimap<int, Link> localizationLinks = graph::filterLinks(signature->getLinks(), Link::kVirtualClosure);
 		localizationLinks = graph::filterLinks(localizationLinks, Link::kSelfRefLink);
 		if(!landmarksDetected.empty() && !_memory->isIncremental())
 		{
+			// 将 detected landmarks 也插入 localizationLinks（已在 optimized poses 中）
 			for(std::map<int, std::set<int> >::iterator iter=landmarksDetected.begin(); iter!=landmarksDetected.end(); ++iter)
 			{
 				if(_optimizedPoses.find(iter->first)!=_optimizedPoses.end())
@@ -3244,31 +3560,39 @@ bool Rtabmap::process(
 		// if:
 		//  1- there are no signatures retrieved,
 		//  2- we are relocalizing on a node already in the optimized graph
+		// 阶段 2 — 准备 localization 专用的约束（localizationLinks）与检查
 		if(!_memory->isIncremental() &&
 		   signaturesRetrieved.empty() &&
 		   !localizationLinks.empty() &&
 		   allLocalizationLinksInGraph)
 		{
+			// 阶段 3 — Localization 模式下的快速验证（使用 odom cache）
+			// 只在一个受控的小子图上试优化并检查最大误差，从而判断定位是否真实可靠（避免采纳错误回环）。
 			bool rejectLocalization = _odomCachePoses.empty();
+			// 如果 odom cache 为空，没有过去的 odom 信息，无法验证连续性，故暂拒绝。
 			if(!_odomCachePoses.empty())
 			{
 				// Verify if the new localization is valid by checking if there is
 				// not too much deformation using current odometry poses
 				// This will also refine localization links
 
+				// 从 _odomCachePoses 与 _odomCacheConstraints 开始（这是机器人短期的里程计轨迹与缓存约束）
 				std::map<int, Transform> poses = _odomCachePoses;
 				std::multimap<int, Link> constraints = _odomCacheConstraints;
 				// add self referring links (e.g., gravity)
+				// 将 signature 的 self-links（如 gravity/prior）加入 constraints
 				std::multimap<int, Link> selfLinks = graph::filterLinks(signature->getLinks(), Link::kSelfRefLink, true);
 				if(_graphOptimizer->priorsIgnored())
 				{
 					selfLinks = graph::filterLinks(selfLinks, Link::kPosePrior);
 				}
 				constraints.insert(selfLinks.begin(), selfLinks.end());
+				// 将 localizationLinks（来自当前 signature 指向图中节点或 landmark 的链接）加入 constraints。
 				for(std::multimap<int, Link>::iterator iter=localizationLinks.begin(); iter!=localizationLinks.end(); ++iter)
 				{
 					constraints.insert(std::make_pair(iter->second.from(), iter->second));
 				}
+				// 把 poses 中不存在但在 _optimizedPoses 中的节点加入 poses，并给它们加上 pose prior（用 priorInfMat）以固定这些节点的位姿
 				cv::Mat priorInfMat = cv::Mat::eye(6,6, CV_64FC1)*_localizationPriorInf;
 				for(std::multimap<int, Link>::iterator iter=constraints.begin(); iter!=constraints.end(); ++iter)
 				{
@@ -3289,6 +3613,7 @@ bool Rtabmap::process(
 				UDEBUG("priorsIgnored was %s", priorsIgnored?"true":"false");
 				_graphOptimizer->setPriorsIgnored(false); //temporary set false to use priors above to fix nodes of the map
 				// If slam2d: get connected graph while keeping original roll,pitch,z values.
+				// 提取与 signature->id() 连通的子图（在 poses, constraints 的范围内），这步通常在 2D SLAM 模式下会保留 roll/pitch/z 等。
 				_graphOptimizer->getConnectedGraph(signature->id(), poses, constraints, posesOut, edgeConstraintsOut);
 				if(ULogger::level() == ULogger::kDebug)
 				{
@@ -3302,6 +3627,7 @@ bool Rtabmap::process(
 				if(!posesOut.empty() &&
 				   posesOut.begin()->first < _odomCachePoses.begin()->first)
 				{
+					// 在提取出的子图上做优化，得到 optPoses（优化后的 poses）和 locOptCovariance（定位的协方差）。
 					optPoses = _graphOptimizer->optimize(posesOut.begin()->first, posesOut, edgeConstraintsOut, locOptCovariance, 0, &optimizationError, &optimizationIterations);
 				}
 				else
@@ -3314,6 +3640,7 @@ bool Rtabmap::process(
 					UDEBUG("Opt  %d %s", iter->first, iter->second.prettyPrint().c_str());
 				}
 
+				// 若 optPoses.empty() 则优化失败，rejectLocalization = true。
 				if(optPoses.empty())
 				{
 					UWARN("Optimization failed, rejecting localization!");
@@ -3324,6 +3651,7 @@ bool Rtabmap::process(
 					UINFO("Compute max graph errors...");
 					const Link * maxLinearLink = 0;
 					const Link * maxAngularLink = 0;
+					// 计算最大线性与角度误差及对应 link，这里会输出 maxLinearErrorRatio / maxAngularErrorRatio 等。
 					graph::computeMaxGraphErrors(
 							optPoses,
 							edgeConstraintsOut,
@@ -3351,6 +3679,7 @@ bool Rtabmap::process(
 								_optimizationMaxError);
 						if(_optimizationMaxError > 0.0f && maxLinearErrorRatio > _optimizationMaxError)
 						{
+							// 若任一超过 _optimizationMaxError（或极端异常且没有 robust 优化器），则拒绝本次定位
 							UWARN("Rejecting localization (%d <-> %d) in this "
 									"iteration because a wrong loop closure has been "
 									"detected after graph optimization, resulting in "
@@ -3393,6 +3722,7 @@ bool Rtabmap::process(
 								_optimizationMaxError);
 						if(_optimizationMaxError > 0.0f && maxAngularErrorRatio > _optimizationMaxError)
 						{
+							// 若任一超过 _optimizationMaxError（或极端异常且没有 robust 优化器），则拒绝本次定位
 							UWARN("Rejecting localization (%d <-> %d) in this "
 									"iteration because a wrong loop closure has been "
 									"detected after graph optimization, resulting in "
@@ -3426,6 +3756,11 @@ bool Rtabmap::process(
 					}
 				}
 
+				// localization 的回退尝试：去掉 local loop closures 再试一次
+				// 如果初次尝试失败，但有全局回环或 landmarks 存在，
+				// 则去掉本地空间闭环（proximity local closures），
+				// 再重试优化（有时 local proximity closures 错误会和 global closures 冲突，去掉它们可能得到合理解）
+				// 提高鲁棒性，避免本地的错误 ICP/visual proximity 覆盖掉全局正确回环。
 				bool hasGlobalLoopClosuresOrLandmarks = false;
 				if(rejectLocalization && 
 					(_localizationSecondTryWithoutProximityLinks && !graph::filterLinks(constraints, Link::kLocalSpaceClosure, true).empty()))
@@ -3578,12 +3913,16 @@ bool Rtabmap::process(
 					}
 				}
 
+				// localization 验证通过后的处理：接受/更新 odom cache 等
+				// 将小子图优化结果写回 odom cache 与 optimized poses，使系统中对定位的认知一致，并为后续的路径/定位决策提供更稳健的数据。
 				if(!rejectLocalization)
 				{
 					if(hasGlobalLoopClosuresOrLandmarks)
 					{
 						// We successfully optimize the graph without local loop closures,
 						// clear them as some of them may be wrong.
+						// 如果是在 remove local loop closures 后成功优化（hasGlobalLoopClosuresOrLandmarks），
+						// 则把 odom cache 中的 local space closure links 清掉（它们可能是不可靠的）。
 						size_t before = _odomCacheConstraints.size();
 						_odomCacheConstraints = graph::filterLinks(_odomCacheConstraints, Link::kLocalSpaceClosure);
 						if(before != _odomCacheConstraints.size())
@@ -3618,6 +3957,7 @@ bool Rtabmap::process(
 					// update localization links
 					UASSERT(uContains(optPoses, signature->id()));
 					Transform newOptPoseInv = optPoses.at(signature->id()).inverse();
+					// 把 localizationLinks 加入 _odomCacheConstraints
 					for(std::multimap<int, Link>::iterator iter=localizationLinks.begin(); iter!=localizationLinks.end(); ++iter)
 					{
 						if(!_localizationSmoothing)
@@ -3629,6 +3969,7 @@ bool Rtabmap::process(
 						else
 						{
 							// Adjust with optimized poses, this will smooth the localization
+							// 如果 _localizationSmoothing 启用，则根据 optPoses 调整这些 link 的变换，使得 localization 更平滑；
 							UASSERT(uContains(optPoses, iter->first));
 							Transform newT = newOptPoseInv * optPoses.at(iter->first);
 							UDEBUG("Adjusted localization link %d->%d after optimization", iter->second.from(), iter->second.to());
@@ -3652,6 +3993,7 @@ bool Rtabmap::process(
 						UINFO("Update localization");
 
 						// update odomCachePoses with optimized poses (but make sure to put them back in odom frame)
+						// 同时更新 _odomCachePoses 中所有 pose（用 mapToOdomCache * optPoses.at(iter->first) 把 map 优化后的 pose 转回 odom cache 坐标系）。
 						Transform mapToOdomCache = signature->getPose() * newOptPoseInv;
 						for(std::map<int, Transform>::iterator iter = _odomCachePoses.begin(); iter!=_odomCachePoses.end(); ++iter)
 						{
@@ -3660,6 +4002,8 @@ bool Rtabmap::process(
 
 						if(_optimizeFromGraphEnd)
 						{
+							// 更新 _optimizedPoses.at(signature->id())
+							// 若 _optimizeFromGraphEnd=true 可能按特定策略调整（保持 map correction 为 identity）
 							// update all previous nodes
 							// Normally _mapCorrection should be identity, but if _optimizeFromGraphEnd
 							// parameters just changed state, we should put back all poses without map correction.
@@ -3729,6 +4073,7 @@ bool Rtabmap::process(
 						}
 						else
 						{
+							// 否则用 newPose 或基于 gravity 的校正后的 newPose 更新当前签名的 pose。
 							Transform newPose = _optimizedPoses.at(localizationLinks.rbegin()->first) * localizationLinks.rbegin()->second.transform().inverse();
 							UDEBUG("newPose=%s", newPose.prettyPrint().c_str());
 							if(_graphOptimizer->isSlam2d() && signature->getPose().is3DoF())
@@ -3767,7 +4112,7 @@ bool Rtabmap::process(
 						}
 						_localizationCovariance = locOptCovariance.empty()?localizationLinks.rbegin()->second.infMatrix().inv():locOptCovariance;
 					}
-					else //delayed localization (wait for more than 1 link)
+					else //如果只有一条 localization link（即还不够稳定），会触发“延迟定位”（delayedLocalization = true），拒绝立即采纳。
 					{
 						UWARN("Localization was good, but waiting for another one to be more accurate (%s>0)", Parameters::kRGBDMaxOdomCacheSize().c_str());
 						delayedLocalization = true;
@@ -3778,6 +4123,7 @@ bool Rtabmap::process(
 
 			if(rejectLocalization)
 			{
+				// 放弃当前的 loop hypothesis（BoW）与 proximity closure；避免错误的回环污染图；在后续循环中会重新寻找或等待新的线索。
 				_loopClosureHypothesis.first = 0;
 				lastProximitySpaceClosureId = 0;
 				rejectedLoopClosure = true;
@@ -3785,10 +4131,14 @@ bool Rtabmap::process(
 		}
 		else
 		{
+			// 阶段 4 — 增量/常规模式：调用 optimizeCurrentMap
+			// 如果不是上面那种快速 localization 流程，则进入常规优化路径：
+			// 该分支实际做了图的全局/局部优化，并在优化后用误差检验以剔除坏回环，保护地图一致性。
 			UINFO("Update map correction");
-			std::map<int, Transform> poses = _optimizedPoses;
+			std::map<int, Transform> poses = _optimizedPoses;  // 初始猜测
 
 			// if _optimizeFromGraphEnd parameter just changed state, don't use optimized poses as guess
+			// 若刚改变这个参数，则清除初始猜测避免用旧猜测产生偏差
 			if(_optimizeFromGraphEndChanged)
 			{
 				UWARN("Optimization: clearing guess poses as %s has changed state, now %s",
@@ -3797,16 +4147,20 @@ bool Rtabmap::process(
 				_optimizeFromGraphEndChanged = false;
 			}
 
+			// 从当前 graph 和 constraints 中提取出要优化的子图并调用图优化器得到 poses（新的 optimized poses）
+			// 和 constraints（新的约束集合，可能包含新加入的 loop closures）。
 			std::multimap<int, Link> constraints;
 			cv::Mat covariance;
 			optimizeCurrentMap(signature->id(), false, poses, covariance, &constraints, &optimizationError, &optimizationIterations);
 
 			// Check added loop closures have broken the graph
 			// (in case of wrong loop closures).
+			// 若 poses 为空 -> 优化失败
 			bool updateConstraints = true;
 			if(poses.empty())
 			{
 				UWARN("Graph optimization failed! Rejecting last loop closures added.");
+				// 移除刚刚加入的 loopClosureLinksAdded（这些边被认为导致了错误）
 				for(std::list<std::pair<int, int> >::iterator iter=loopClosureLinksAdded.begin(); iter!=loopClosureLinksAdded.end(); ++iter)
 				{
 					_memory->removeLink(iter->first, iter->second);
@@ -3817,6 +4171,7 @@ bool Rtabmap::process(
 				lastProximitySpaceClosureId = 0;
 				rejectedLoopClosure = true;
 			}
+			// 若优化成功且处于增量模式且添加了回环：
 			else if(_memory->isIncremental() &&
 			  loopClosureLinksAdded.size() &&
 			  optimizationIterations > 0 &&
@@ -3825,6 +4180,7 @@ bool Rtabmap::process(
 				UINFO("Compute max graph errors...");
 				const Link * maxLinearLink = 0;
 				const Link * maxAngularLink = 0;
+				// 计算最大图误差
 				graph::computeMaxGraphErrors(
 						poses,
 						constraints,
@@ -3840,6 +4196,8 @@ bool Rtabmap::process(
 				}
 
 				bool reject = false;
+				// 若 maxLinearErrorRatio 或 maxAngularErrorRatio 超阈值 _optimizationMaxError，
+				// 则把本次刚添加的所有 loop closures 全部移除（回退）并标记 rejectedLoopClosure = true
 				if(maxLinearLink)
 				{
 					UINFO("Max optimization linear error = %f m (link %d->%d, var=%f, ratio error/std=%f)", maxLinearError, maxLinearLink->from(), maxLinearLink->to(), maxLinearLink->transVariance(), maxLinearError/sqrt(maxLinearLink->transVariance()));
@@ -3929,6 +4287,7 @@ bool Rtabmap::process(
 				}
 			}
 
+			// 阶段 5 — 更新约束与优化结果写回（接受优化）
 			if(updateConstraints)
 			{
 				UINFO("Updated local map (old size=%d, new size=%d)", (int)_optimizedPoses.size(), (int)poses.size());
@@ -3939,6 +4298,8 @@ bool Rtabmap::process(
 		}
 
 		// Update map correction, it should be identify when optimizing from the last node
+		// 阶段 6 — 地图校正（map correction）与统计更新
+		// 保存并维护从 odom 到 map 的变换，使系统能够将传感器/里程计读数与地图约束对齐。
 		UASSERT(_optimizedPoses.find(signature->id()) != _optimizedPoses.end());
 		if(fakeOdom && _mapCorrectionBackup.isNull())
 		{
@@ -3947,6 +4308,7 @@ bool Rtabmap::process(
 		previousMapCorrection = _mapCorrection;
 		_mapCorrection = _optimizedPoses.at(signature->id()) * signature->getPose().inverse();
 		// Update statistics about the closest node in the graph using the actual loop closure
+		// 阶段 7 — 最后清理与时间统计
 		if(!_memory->isIncremental() && !_lastLocalizationPose.isNull())
 		{
 			int closestNode = _loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId;
@@ -3977,7 +4339,10 @@ bool Rtabmap::process(
 			}
 		}
 	}
+	// newLocId 优先用 loop hypothesis（BoW 全局回环），其次用 proximity（local space closure）。
+	// 若都没有，则有可能用 landmark 的原始观测者来更新 _lastLocalizationNodeId。
 	int newLocId = _loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId>0?lastProximitySpaceClosureId:0;
+	// _lastLocalizationNodeId 用于统计/决策，例如判断与最近定位节点的距离、路径规划参考等。
 	_lastLocalizationNodeId = newLocId!=0?newLocId:_lastLocalizationNodeId;
 	if(newLocId==0 && !landmarksDetected.empty())
 	{
@@ -4353,18 +4718,24 @@ bool Rtabmap::process(
 	//============================================================
 	// TRANSFER
 	//============================================================
-	// If time allowed for the detection exceeds the limit of
-	// real-time, move the oldest signature with less frequency
-	// entry (from X oldest) from the short term memory to the
-	// long term memory.
+	// TRANSFER 阶段是 RTAB-Map 的 内存管理核心机制：
+	// 当处理一帧图像花费太多时间、或工作内存（Working Memory）变太大时， 
+	// 系统会 把最老、最不常访问的节点移到长期记忆（Long-Term Memory, LTM）。
 	//============================================================
+	// 目的 1：保证系统实时性
+	// 目的 2：保持地图局部区域完整
 	double totalTime = timerTotal.ticks();
 	ULOGGER_INFO("Total time processing = %fs...", totalTime);
+	// 判断是否触发 TRANSFER（移出工作内存）
+	// 若：当前帧处理时间 totalTime > maxAllowedTime，或者工作内存中的节点数量超过 _maxMemoryAllowed
 	if((_maxTimeAllowed != 0 && totalTime*1000>_maxTimeAllowed) ||
 		(_maxMemoryAllowed != 0 && _memory->getWorkingMem().size() > _maxMemoryAllowed))
 	{
 		ULOGGER_INFO("Removing old signatures because time limit is reached %f>%f or memory is reached %d>%d...", totalTime*1000, _maxTimeAllowed, _memory->getWorkingMem().size(), _maxMemoryAllowed);
+		// 表示“这些节点免疫，不允许被转移出工作内存”。
 		immunizedLocations.insert(_lastLocalizationNodeId); // keep the latest localization in working memory
+		// _memory->forget() 会选择性地把最不重要的节点（低频、老）转移到 LTM, 返回删除的节点列表
+		// 转移（forget）一些不重要的老节点到 LTM 以释放内存、提高实时性。
 		std::list<int> transferred = _memory->forget(immunizedLocations);
 		signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
 		if(!_someNodesHaveBeenTransferred && transferred.size())
@@ -4375,21 +4746,25 @@ bool Rtabmap::process(
 	_lastProcessTime = totalTime;
 
 	// cleanup cached gps values
+	// 更新 GPS 缓存
 	for(std::list<int>::iterator iter=signaturesRemoved.begin(); iter!=signaturesRemoved.end() && _gpsGeocentricCache.size(); ++iter)
 	{
 		_gpsGeocentricCache.erase(*iter);
 	}
 
 	//Remove optimized poses from signatures transferred
+	// 若删除节点，同时存在优化图（_optimizedPoses 或 _constraints），需要刷新局部地图
 	if(signaturesRemoved.size() && (_optimizedPoses.size() || _constraints.size()))
 	{
 		//refresh the local map because some transferred nodes may have broken the tree
+		// 选取局部地图重建的起点 ID
 		int id = 0;
 		if(!_memory->isIncremental() && (_lastLocalizationNodeId > 0 || _path.size()))
 		{
 			if(_path.size())
 			{
 				// priority on node on the path
+				// 优先选择：path 路径节点（如果正在导航）
 				UASSERT(_pathCurrentIndex < _path.size());
 				UASSERT_MSG(uContains(_optimizedPoses, _path.at(_pathCurrentIndex).first), uFormat("id=%d", _path.at(_pathCurrentIndex).first).c_str());
 				id = _path.at(_pathCurrentIndex).first;
@@ -4397,6 +4772,7 @@ bool Rtabmap::process(
 			}
 			else
 			{
+				// 选择：最近的 localization 节点 _lastLocalizationNodeId
 				if(uContains(_optimizedPoses, _lastLocalizationNodeId))
 				{
 					id = _lastLocalizationNodeId;
@@ -4404,6 +4780,7 @@ bool Rtabmap::process(
 				}
 				else
 				{
+					// 否则：_lastLocalizationNodeId 无效 → 清零
 					UDEBUG("Clearing _lastLocalizationNodeId(%d)", _lastLocalizationNodeId);
 					_lastLocalizationNodeId = 0;
 				}
@@ -4413,6 +4790,8 @@ bool Rtabmap::process(
 				_optimizedPoses.size() &&
 				_memory->getLastWorkingSignature())
 		{
+			// 使用 last working signature → 当前图像对应的节点 ID。
+			// 需要从一个“仍存在于工作内存中的有效节点”重新提取局部子图。
 			id = _memory->getLastWorkingSignature()->id();
 			UDEBUG("Refresh local map from %d", id);
 		}
@@ -4425,8 +4804,11 @@ bool Rtabmap::process(
 			}
 			UASSERT_MSG(_memory->getSignature(id) != 0, uFormat("id=%d", id).c_str());
 
+			// 处理只删除了最后一个签名的情况
 			if(signaturesRemoved.size() == 1 && signaturesRemoved.front() == lastSignatureData.id())
 			{
+				// 特殊优化：若被删除的是当前帧前的最后一个节点
+				// 则只需从 _optimizedPoses 和 _constraints 中删除它，不需要重建整个局部地图
 				int lastId = signaturesRemoved.front();
 				UDEBUG("Detected that only last signature has been removed (lastId=%d)", lastId);
 				_optimizedPoses.erase(lastId);
@@ -4445,7 +4827,8 @@ bool Rtabmap::process(
 			}
 			else
 			{
-
+				// 否则，一般情况：需要根据邻居关系刷新局部地图
+				// 保持局部 SLAM 图只包含当前可用、未被转移出工作内存的节点。
 				std::map<int, int> ids = _memory->getNeighborsId(id, 0, 0, true);
 				for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end();)
 				{
@@ -4453,6 +4836,7 @@ bool Rtabmap::process(
 					{
 						UDEBUG("Removed %d from local map", iter->first);
 						UASSERT(iter->first != _lastLocalizationNodeId);
+						// 删除 _optimizedPoses 中不属于局部图的节点
 						_optimizedPoses.erase(iter++);
 
 						if(!_globalScanMap.empty())
@@ -4471,6 +4855,7 @@ bool Rtabmap::process(
 				{
 					if(iter->first > 0 && (!uContains(ids, iter->second.from()) || !uContains(ids, iter->second.to())))
 					{
+						// 删除 _constraints 中不属于局部图的边
 						_constraints.erase(iter++);
 					}
 					else
@@ -4482,6 +4867,7 @@ bool Rtabmap::process(
 		}
 		else
 		{
+			// 若无法选定有效 node id → 清空优化图
 			if(!_optimizedPoses.empty())
 				UDEBUG("Optimized poses cleared!");
 			_optimizedPoses.clear();
@@ -4489,6 +4875,8 @@ bool Rtabmap::process(
 		}
 	}
 	// just some verifications to make sure that planning path is still in the local map!
+	// 确保路径规划上的“当前点”和“目标点”仍在局部地图中。
+	// 如果不在，路径应该被视为无效（ASSERT 会直接提示问题）。
 	if(_path.size())
 	{
 		UASSERT(_pathCurrentIndex < _path.size());

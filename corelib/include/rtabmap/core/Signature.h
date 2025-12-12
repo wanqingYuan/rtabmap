@@ -44,7 +44,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace rtabmap
 {
-
+/**
+ * RTAB-Map 中的 Signature（节点）维护的是“邻接表（Adjacency List）”
+ * 每个 Signature 的内部数据结构维护 自己的 Links，与其他节点独立。
+ * 这意味着 Link 是 存储在两个节点内部的两份数据，不是共享的。
+ */
 class RTABMAP_CORE_EXPORT Signature
 {
 
@@ -98,6 +102,7 @@ public:
 	void setSaved(bool saved) {_saved = saved;}
 	void setModified(bool modified) {_modified = modified; _linksModified = modified;}
 
+	// map<neighbor_id, Link>
 	const std::multimap<int, Link> & getLinks() const {return _links;}
 	bool isSaved() const {return _saved;}
 	bool isModified() const {return _modified || _linksModified;}
