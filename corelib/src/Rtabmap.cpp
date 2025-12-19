@@ -1690,7 +1690,7 @@ bool Rtabmap::process(
 		// 邻居链路优化 Neighbor Link Refining（最关键）
 		Transform newPose;
 		bool intermediateNodeRefining = false;
-		if(_neighborLinkRefining &&
+		if(_neighborLinkRefining && // 是否对相邻节点（neighbor links）之间的约束关系进行二次精细化（refine）优化。
 			signature->getLinks().size() &&
 			signature->getLinks().begin()->second.type() == Link::kNeighbor &&
 		   _memory->isIncremental() && // ignore pose matching in localization mode 定位模式不执行
@@ -2155,20 +2155,26 @@ bool Rtabmap::process(
 			//============================================================
 			ULOGGER_INFO("computing likelihood...");
 
-			std::list<int> signaturesToCompare;
-			GPS originGPS;
-			Transform originOffsetENU = Transform::getIdentity();
-			// 如果启用 GPS，则需要从 GPS 坐标进行过滤
-			// 计算当前节点的 ENU 坐标 & 为工作记忆中每个节点计算 ENU 坐标 & 根据 GPS 距离过滤掉太远的节点
+			std::list<int> signaturesToCompare; // 存储 待比较回环的节点 ID 列表
+			GPS originGPS; // 当前节点的 参考 GPS 坐标,如果当前节点没有 GPS，会从附近节点推断
+			Transform originOffsetENU = Transform::getIdentity(); // 局部坐标系 → ENU 坐标系的偏移变换
+			// 利用 GPS 将地图节点转换到 ENU 坐标系，并过滤掉距离过远的回环候选节点。
+			// 当启用 GPS 回环约束（_loopGPS）时，计算当前节点在 ENU 坐标系中的位置，并为后续的回环检测过滤提供参考坐标。
 			if(_loopGPS)
 			{
+				// 尝试直接使用当前节点的 GPS
 				originGPS = signature->sensorData().gps();
+				// stamp() == 0.0 → 当前节点 没有 GPS 
+				// _currentSessionHasGPS → 当前会话中 曾经有 GPS 数据 
+				// 说明：可以从历史节点推算当前 GPS
 				if(originGPS.stamp() == 0.0 && _currentSessionHasGPS)
 				{
 					UTimer tmpT;
+					// 已有优化后的位姿图 & 处于增量建图模式（非纯定位）
 					if(_optimizedPoses.size() && _memory->isIncremental())
 					{
 						//Search for latest node having GPS linked to current signature not too far.
+						// 在附近节点中查找最近的 GPS 节点 <key：节点 ID,value：图中距离（或空间距离）>
 						std::map<int, float> nearestIds = graph::findNearestNodes(signature->id(), _optimizedPoses, _localRadius);
 						for(std::map<int, float>::reverse_iterator iter=nearestIds.rbegin(); iter!=nearestIds.rend() && iter->first>0; ++iter)
 						{
@@ -2176,9 +2182,14 @@ bool Rtabmap::process(
 							UASSERT(s!=0);
 							if(s->sensorData().gps().stamp() > 0.0)
 							{
+								// 找到第一个有 GPS 的节点, 作为参考节点
+								// 获取该节点的 GPS
 								originGPS = s->sensorData().gps();
+								// 获取该节点在优化图中的位姿
 								const Transform & sPose = _optimizedPoses.at(s->id());
+								// 构造 ENU 方向旋转,最终得到 局部坐标对齐到 ENU 的旋转
 								Transform localToENU(0,0,(float)((-(originGPS.bearing()-90))*M_PI/180.0) - sPose.theta());
+								// 计算当前节点的 ENU 偏移
 								originOffsetENU = localToENU * (sPose.rotation()*(sPose.inverse()*_optimizedPoses.at(signature->id())));
 								break;
 							}
@@ -2195,29 +2206,39 @@ bool Rtabmap::process(
 				}
 			}
 
-			// 过滤，加入 signaturesToCompare
+			// 遍历工作记忆中的所有节点，根据 GPS 计算它们与当前节点的 ENU 空间距离，只保留在 _localRadius 范围内的节点作为回环候选。
+			// 如果没有 GPS，则不进行过滤，全部接受。
+			// _workingMem <id,age>
 			for(std::map<int, double>::const_iterator iter=_memory->getWorkingMem().begin();
 				iter!=_memory->getWorkingMem().end();
 				++iter)
 			{
+				// id > 0：真实节点
 				if(iter->first > 0)
 				{
 					const Signature * s = _memory->getSignature(iter->first);
 					UASSERT(s!=0);
-					if(s->getWeight() != -1) // ignore intermediate nodes
+					if(s->getWeight() != -1) // 忽略中间节点，weight == -1表示 中间节点 / 临时节点,不参与回环
 					{
 						bool accept = true;
+						// 如果 当前节点有 GPS → 才启用 GPS 过滤
 						if(originGPS.stamp()>0.0)
 						{
+							// 查找/构建候选节点的 GPS 缓存
 							std::map<int, std::pair<cv::Point3d, Transform> >::iterator cacheIter = _gpsGeocentricCache.find(s->id());
+							//  GPS 缓存不存在 → 尝试构建
 							if(cacheIter == _gpsGeocentricCache.end())
 							{
+								// 读取节点 GPS
 								GPS gps = s->sensorData().gps();
 								Transform offsetENU = Transform::getIdentity();
+								// 如果节点本身没有 GPS
 								if(gps.stamp()==0.0)
 								{
+									// 推算该节点的 GPS 和 ENU 偏移
 									_memory->getGPS(s->id(), gps, offsetENU, false);
 								}
+								// 成功获取 GPS → 存入缓存
 								if(gps.stamp() > 0.0)
 								{
 									cacheIter = _gpsGeocentricCache.insert(
@@ -2226,18 +2247,23 @@ bool Rtabmap::process(
 								}
 							}
 
-
+							// 如果该节点最终有 GPS
 							if(cacheIter != _gpsGeocentricCache.end())
 							{
+								// 找到当前节点（origin）的缓存
 								std::map<int, std::pair<cv::Point3d, Transform> >::iterator originIter = _gpsGeocentricCache.find(signature->id());
 								UASSERT(originIter != _gpsGeocentricCache.end());
+								// 计算 ENU 相对位移
 								cv::Point3d relativePose = GeodeticCoords::Geocentric_WGS84ToENU_WGS84(cacheIter->second.first, originIter->second.first, originGPS.toGeodeticCoords());
+								// 处理 GPS 误差
 								const double & error = originGPS.error();
+								// 应用 ENU 偏移补偿
 								const Transform & offsetENU = cacheIter->second.second;
 								relativePose.x += offsetENU.x() - originOffsetENU.x();
 								relativePose.y += offsetENU.y() - originOffsetENU.y();
 								relativePose.z += offsetENU.z() - originOffsetENU.z();
-								 // ignore altitude if difference is under GPS error
+								// ignore altitude if difference is under GPS error 如果高度差 小于误差 → 忽略
+								//  Z 轴（高度）特殊处理
 								if(relativePose.z>error)
 								{
 									relativePose.z -= error;
@@ -2250,16 +2276,19 @@ bool Rtabmap::process(
 								{
 									relativePose.z = 0;
 								}
+								// 在 GPS 空间距离内 → 接受
 								accept = uNormSquared(relativePose.x, relativePose.y, relativePose.z) < _localRadius*_localRadius;
 							}
 						}
 
+						// 否则：全部节点直接接受（当前节点没有GPS时）
 						if(accept)
 						{
 							signaturesToCompare.push_back(iter->first);
 						}
 					}
 				}
+				// id <= 0：虚拟节点（Virtual Signature）
 				else
 				{
 					// virtual signature should be added
@@ -2268,6 +2297,7 @@ bool Rtabmap::process(
 			}
 
 			// Likelihood（似然）计算
+			// RTAB-Map 回环检测中“外观相似度计算”的核心实现之一。
 			// 这是 RTAB-Map 的核心：使用 Bag-of-Words / visual features & 对新节点与所有候选节点计算匹配得分（似然）
 			rawLikelihood = _memory->computeLikelihood(signature, signaturesToCompare);
 
@@ -2459,6 +2489,7 @@ bool Rtabmap::process(
 			// Direct neighbors TIME
 			// 获取“时间邻居” TIME 邻居 = 连续的 Odom chain（比如：ID 300 → 301 → 302 → …）
 			ULOGGER_DEBUG("In TIME");
+			// neighbors <nodeId,拓扑距离>
 			neighbors = _memory->getNeighborsId(retrievalId,
 					neighborhoodSize,
 					_maxRetrieved,
@@ -2475,28 +2506,39 @@ bool Rtabmap::process(
 			// 3 记录被重新激活的 ID 4 记录被免疫的 ID
 			bool firstPassDone = false; // just to avoid checking to STM after the first pass
 			int m = 0;
+			// m = 邻域层级（hop distance） 0：自身 1：直接邻居 2：二跳邻居
+			// neighborhoodSize：免疫/激活的最大拓扑半径
 			while(m < neighborhoodSize)
 			{
+				// 自动排序（升序） 后面会 反向插入 到列表，保证确定性顺序
 				std::set<int> idsSorted;
 				for(std::map<int, int>::iterator iter=neighbors.begin(); iter!=neighbors.end();)
 				{
+					// 第一层特殊处理：排除 STM,也就是排除自身节点
 					if(!firstPassDone && _memory->isInSTM(iter->first))
 					{
 						neighbors.erase(iter++);
 					}
+					// 匹配当前层 m 的节点
 					else if(iter->second == m)
 					{
+						// 防止重复激活
 						if(reactivatedIdsSet.find(iter->first) == reactivatedIdsSet.end())
 						{
+							// reactivatedIdsSet中不存在此节点
+							// 加入激活集合
 							idsSorted.insert(iter->first);
 							reactivatedIdsSet.insert(iter->first);
 
+							// 统计直接邻居（m == 1）
 							if(m == 1 && _memory->getSignature(iter->first) == 0)
 							{
 								++nbDirectNeighborsInDb;
 							}
 
 							//immunized locations in the neighborhood from being transferred
+							// 将该节点加入 免疫集合 
+							// 被免疫的节点：不会被记忆管理算法转移/清除
 							if(immunizedLocations.insert(iter->first).second)
 							{
 								++immunizedGlobally;
@@ -2504,8 +2546,10 @@ bool Rtabmap::process(
 
 							//UDEBUG("nt=%d m=%d immunized=1", iter->first, iter->second);
 						}
+						// 当前节点已处理， 防止后续层重复处理， 从 neighbors 中移除
 						neighbors.erase(iter++);
 					}
+					// 不是当前层 → 跳过
 					else
 					{
 						++iter;
@@ -2635,15 +2679,19 @@ bool Rtabmap::process(
 			}
 		}
 
+		// 如果：所有节点都已经在 WM 且不允许任何局部免疫 
+		// 那么 整个逻辑没有意义，直接跳过
 		if(!(_memory->allNodesInWM() && maxLocalLocationsImmunized == 0))
 		{
 			// immunize the path from the nearest local location to the current location
-			// 免疫当前节点到最近局部节点之间的路径
+			// 免疫“最近局部节点 → 当前节点”的路径
+			// 免疫数量未达上限 & 增量建图模式
 			if(immunizedLocally < maxLocalLocationsImmunized &&
 				_memory->isIncremental()) // Can only work in mapping mode
 			{
 				std::map<int ,Transform> poses;
 				// remove poses from STM
+				// 构建可用位姿集合（去掉 STM）STM 节点：不稳定 可能马上被移除
 				for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
 				{
 					if(iter->first > 0 && !_memory->isInSTM(iter->first))
@@ -2654,14 +2702,16 @@ bool Rtabmap::process(
 				
 				// 找出距离当前节点最近的“局部”节点
 				int nearestId = graph::findNearestNode(poses, _optimizedPoses.at(signature->id()));
-
+				// 距离阈值检查
 				if(nearestId > 0 &&
 					(_localRadius==0 ||
 					 _optimizedPoses.at(signature->id()).getDistance(_optimizedPoses.at(nearestId)) < _localRadius))
 				{
 					std::multimap<int, int> links;
+					// 构建局部图（约束 → 无向图）
 					for(std::multimap<int, Link>::iterator iter=_constraints.begin(); iter!=_constraints.end(); ++iter)
 					{
+						// if(from,to 都在 optimizedPoses)
 						if(uContains(_optimizedPoses, iter->second.from()) && uContains(_optimizedPoses, iter->second.to()))
 						{
 							links.insert(std::make_pair(iter->second.from(), iter->second.to()));
@@ -2950,11 +3000,14 @@ bool Rtabmap::process(
 				UDEBUG("nearestPoses=%d", (int)nearestPoses.size());
 
 				// segment poses by paths, only one detection per path, landmarks are ignored
-				// 对 nearby 节点根据路径分组
+				// 获取未排序的最近路径集合
+				// key (int)：路径起点（某个候选近邻节点）
+				// value (map<int, Transform>)：从当前节点出发 到该起点节点的一条拓扑路径 
+				// map 中包含路径上的所有节点及其位姿
 				std::map<int, std::map<int, Transform> > nearestPathsNotSorted = getPaths(nearestPoses, _optimizedPoses.at(signature->id()), _proximityMaxGraphDepth);
 				UDEBUG("got %d paths", (int)nearestPathsNotSorted.size());
 				// sort nearest paths by highest likelihood (if two have same likelihood, sort by id)
-				// 按路径的 “最高似然” 排序
+				// 按路径的 “最高似然” 排序，一条路径的优先级 = 路径上最“像当前节点”的那个节点
 				std::map<NearestPathKey, std::map<int, Transform> > nearestPaths;
 				Transform currentPoseInv = _optimizedPoses.at(signature->id()).inverse();
 				for(std::map<int, std::map<int, Transform> >::const_iterator iter=nearestPathsNotSorted.begin();iter!=nearestPathsNotSorted.end(); ++iter)
@@ -2965,8 +3018,15 @@ bool Rtabmap::process(
 					float smallestDistanceSqr = -1;
 					for(std::map<int, Transform>::const_iterator jter=path.begin(); jter!=path.end(); ++jter)
 					{
+						// 读取外观似然，从前面计算好的 likelihood 中读取：
 						float v = uValue(likelihood, jter->first, 0.0f);
+						// 计算空间距离
+						// jter->second：路径节点在世界坐标系下的位姿
+						// currentPoseInv * pose：得到该节点在当前坐标系下的相对位姿
 						float distance = (currentPoseInv * jter->second).getNormSquared();
+						// 选择路径“最优节点”
+						// 外观似然更高 → 优先
+						// 如果似然相同：空间距离更近 → 优先
 						if(v > highestLikelihood || (v == highestLikelihood && (smallestDistanceSqr < 0 || distance < smallestDistanceSqr)))
 						{
 							highestLikelihood = v;
@@ -2974,6 +3034,7 @@ bool Rtabmap::process(
 							smallestDistanceSqr = distance;
 						}
 					}
+					// 更新路径评分
 					nearestPaths.insert(std::make_pair(NearestPathKey(highestLikelihood, highestLikelihoodId, smallestDistanceSqr), path));
 				}
 				UDEBUG("nearestPaths=%d proximityMaxPaths=%d", (int)nearestPaths.size(), _proximityMaxPaths);
@@ -3528,24 +3589,29 @@ bool Rtabmap::process(
 	{
 		UASSERT(uContains(_optimizedPoses, signature->id()));
 
-		//used in localization mode: filter virtual links
-		// 在 localization 模式下，构建 localizationLinks 并检查其是否都在 graph 中，目的是找出“可用于定位/约束当前节点的外部链接集合”。
-		// localizationLinks 包含虚拟闭环（path linking）并且排除了 self-ref links
+		// used in localization mode: filter virtual links
+		// 从当前 节点 中找出“定位约束”，排除Virtual类型
+		// filterLinks 默认为从links中去除filterType；如果inverted为true，则是只保留filterType
 		std::multimap<int, Link> localizationLinks = graph::filterLinks(signature->getLinks(), Link::kVirtualClosure);
+		// 从 localizationLinks 排除 self-ref links（自己 → 自己 的 link）
 		localizationLinks = graph::filterLinks(localizationLinks, Link::kSelfRefLink);
+		// 定位模式下检测到landmarks时
 		if(!landmarksDetected.empty() && !_memory->isIncremental())
 		{
-			// 将 detected landmarks 也插入 localizationLinks（已在 optimized poses 中）
 			for(std::map<int, std::set<int> >::iterator iter=landmarksDetected.begin(); iter!=landmarksDetected.end(); ++iter)
 			{
+				// iter->first：landmark 的 node id
+				// 如果landmark 本身 已经在地图里
 				if(_optimizedPoses.find(iter->first)!=_optimizedPoses.end())
 				{
 					UASSERT(uContains(signature->getLandmarks(), iter->first));
+					// 把 landmark 约束“补充进定位约束集合”
 					localizationLinks.insert(std::make_pair(iter->first, signature->getLandmarks().at(iter->first)));
 				}
 			}
 		}
 
+		// 检查：这些定位约束是否都在图里？
 		bool allLocalizationLinksInGraph = !localizationLinks.empty();
 		for(std::multimap<int, Link>::iterator iter=localizationLinks.begin(); iter!=localizationLinks.end(); ++iter)
 		{
@@ -3567,7 +3633,6 @@ bool Rtabmap::process(
 		   allLocalizationLinksInGraph)
 		{
 			// 阶段 3 — Localization 模式下的快速验证（使用 odom cache）
-			// 只在一个受控的小子图上试优化并检查最大误差，从而判断定位是否真实可靠（避免采纳错误回环）。
 			bool rejectLocalization = _odomCachePoses.empty();
 			// 如果 odom cache 为空，没有过去的 odom 信息，无法验证连续性，故暂拒绝。
 			if(!_odomCachePoses.empty())
@@ -3576,47 +3641,69 @@ bool Rtabmap::process(
 				// not too much deformation using current odometry poses
 				// This will also refine localization links
 
-				// 从 _odomCachePoses 与 _odomCacheConstraints 开始（这是机器人短期的里程计轨迹与缓存约束）
+				// 初始化一个“可优化的子图”
+				// _odomCachePoses：最近 odom 累积的一小段轨迹，是可调整的（变量节点）
+				// _odomCacheConstraints：这些节点之间的里程计约束
 				std::map<int, Transform> poses = _odomCachePoses;
 				std::multimap<int, Link> constraints = _odomCacheConstraints;
 				// add self referring links (e.g., gravity)
-				// 将 signature 的 self-links（如 gravity/prior）加入 constraints
+				// 筛选出 self-ref links（重力 / 先验/IMU 姿态约束）
 				std::multimap<int, Link> selfLinks = graph::filterLinks(signature->getLinks(), Link::kSelfRefLink, true);
+				// 如果 optimizer 忽略 prior，则删掉
 				if(_graphOptimizer->priorsIgnored())
 				{
 					selfLinks = graph::filterLinks(selfLinks, Link::kPosePrior);
 				}
+				// 将self-ref links加入约束集合,保证姿态稳定性（尤其是 roll / pitch）
 				constraints.insert(selfLinks.begin(), selfLinks.end());
 				// 将 localizationLinks（来自当前 signature 指向图中节点或 landmark 的链接）加入 constraints。
 				for(std::multimap<int, Link>::iterator iter=localizationLinks.begin(); iter!=localizationLinks.end(); ++iter)
 				{
 					constraints.insert(std::make_pair(iter->second.from(), iter->second));
 				}
-				// 把 poses 中不存在但在 _optimizedPoses 中的节点加入 poses，并给它们加上 pose prior（用 priorInfMat）以固定这些节点的位姿
+				// 把“地图节点”加入 poses，并用 PosePrior 固定住
+				// prior 信息矩阵 ,_localizationPriorInf 通常很大 ⇒ 极小方差, 近似“硬约束”
 				cv::Mat priorInfMat = cv::Mat::eye(6,6, CV_64FC1)*_localizationPriorInf;
+				// 遍历所有约束，找出涉及的 map 节点
 				for(std::multimap<int, Link>::iterator iter=constraints.begin(); iter!=constraints.end(); ++iter)
 				{
+					// _optimizedPoses 是 已经优化过的全局地图位姿 ：不允许被改, 只能当锚点
 					std::map<int, Transform>::iterator iterPose = _optimizedPoses.find(iter->second.to());
+					// 如果地图节点还不在 poses 中
 					if(iterPose != _optimizedPoses.end() && poses.find(iterPose->first) == poses.end())
 					{
+						// 把该地图节点加入 poses, 但还不够 因为 optimizer 会把它当变量节点！
 						poses.insert(*iterPose);
 						// make the poses in the map fixed
+						// 给该节点加一个 PosePrior（固定它）通过 self-prior 把地图节点“钉死”
+						// 所以优化时只能动的是：odom cache 中的节点 和 当前帧位姿
 						constraints.insert(std::make_pair(iterPose->first, Link(iterPose->first, iterPose->first, Link::kPosePrior, iterPose->second, priorInfMat)));
 						UDEBUG("Constraint %d->%d: %s (type=%s, var=%f)", iterPose->first, iterPose->first, iterPose->second.prettyPrint().c_str(), Link::typeName(Link::kPosePrior).c_str(), 1./_localizationPriorInf);
 					}
 					UDEBUG("Constraint %d->%d: %s (type=%s, var = %f %f)", iter->second.from(), iter->second.to(), iter->second.transform().prettyPrint().c_str(), iter->second.typeName().c_str(), iter->second.transVariance(), iter->second.rotVariance());
 				}
 
+				// 从刚才构造的 poses / constraints 中，提取一个与当前帧连通的子图，
+				// 利用 pose prior 把地图节点固定住，在这个子图上跑一次 graph optimization，
+				// 得到用于定位的最优位姿（optPoses）和协方差
 				std::map<int, Transform> posesOut;
 				std::multimap<int, Link> edgeConstraintsOut;
+				// 备份并强制启用 prior（非常关键）
 				bool priorsIgnored = _graphOptimizer->priorsIgnored();
 				UDEBUG("priorsIgnored was %s", priorsIgnored?"true":"false");
-				_graphOptimizer->setPriorsIgnored(false); //temporary set false to use priors above to fix nodes of the map
-				// If slam2d: get connected graph while keeping original roll,pitch,z values.
-				// 提取与 signature->id() 连通的子图（在 poses, constraints 的范围内），这步通常在 2D SLAM 模式下会保留 roll/pitch/z 等。
+				// 前面专门给地图节点加了 kPosePrior, 如果 optimizer 当前配置是：Optimizer/PriorsIgnored=true
+				// 那这些 prior 就会被直接忽略
+				// 这里强制启用 prior 的目的, 确保地图节点被“钉死”，不参与优化
+				_graphOptimizer->setPriorsIgnored(false);
+				// 从 poses + constraints 构成的大图中, 只保留：与当前节点 signature->id() 连通的部分
+				// 输出：posesOut, edgeConstraintsOut
+				// 为什么一定要提取连通子图？
+				// 防止优化无关节点（节省计算）;避免奇异矩阵（不连通图不可解）;保证 root 节点可达 
+				// 尤其在定位模式：odom cache 很小; 地图节点很多 ;只优化“当前相关的那一小撮”
 				_graphOptimizer->getConnectedGraph(signature->id(), poses, constraints, posesOut, edgeConstraintsOut);
 				if(ULogger::level() == ULogger::kDebug)
 				{
+					// Debug：打印子图的初始位姿
 					for(std::map<int, Transform>::iterator iter=posesOut.begin(); iter!=posesOut.end(); ++iter)
 					{
 						UDEBUG("Pose %d %s", iter->first, iter->second.prettyPrint().c_str());
@@ -3624,17 +3711,26 @@ bool Rtabmap::process(
 				}
 				cv::Mat locOptCovariance;
 				std::map<int, Transform> optPoses;
-				if(!posesOut.empty() &&
-				   posesOut.begin()->first < _odomCachePoses.begin()->first)
+				// 判断子图是否合法（非常关键的安全检查）
+				// posesOut.begin()->first 子图中最小的 node id
+				// 判断条件：子图里 必须包含“地图节点”（老节点）。RTAB-Map 的 node id 是严格单调递增的 地图节点的 id 永远小于 odom cache 节点的 id
+				// 否则说明：所有约束都只发生在 odom cache 内, 根本没有锚点, 优化结果无意义（整块漂）
+				if(!posesOut.empty() && posesOut.begin()->first < _odomCachePoses.begin()->first)
 				{
-					// 在提取出的子图上做优化，得到 optPoses（优化后的 poses）和 locOptCovariance（定位的协方差）。
+					// 在 2D SLAM：只优化 x / y / yaw, 保留 roll / pitch / z
+					// 这才是 localizationLinks / landmark / prior 真正“生效”的地方
+					// 地图节点：被 prior 固定, odom cache：被拉向地图
+					// 在提取出的子图上做优化，得到 optPoses（优化后的位姿）和 locOptCovariance（定位的协方差,定位不确定度）。
+					// 这里不会写回 _optimizedPoses, 不会改变地图, 只是临时结果
 					optPoses = _graphOptimizer->optimize(posesOut.begin()->first, posesOut, edgeConstraintsOut, locOptCovariance, 0, &optimizationError, &optimizationIterations);
 				}
 				else
 				{
+					// 如果不满足，直接报错：
 					UERROR("Invalid localization constraints");
 				}
-				_graphOptimizer->setPriorsIgnored(priorsIgnored); // set back
+				// 恢复 optimizer 原配置
+				_graphOptimizer->setPriorsIgnored(priorsIgnored);
 				for(std::map<int, Transform>::iterator iter=optPoses.begin(); iter!=optPoses.end(); ++iter)
 				{
 					UDEBUG("Opt  %d %s", iter->first, iter->second.prettyPrint().c_str());
@@ -4139,6 +4235,10 @@ bool Rtabmap::process(
 
 			// if _optimizeFromGraphEnd parameter just changed state, don't use optimized poses as guess
 			// 若刚改变这个参数，则清除初始猜测避免用旧猜测产生偏差
+			// _optimizeFromGraphEndChanged = false（默认）：从 root（最老节点）开始优化，true：固定历史节点， 只优化最近一段
+			// OptimizeFromGraphEnd = false → 全图自由优化 | OptimizeFromGraphEnd = true → 历史节点被固定
+			// 如果继续用旧 _optimizedPoses 作为初值，初值中： 历史节点可能已经被移动 新约束中： 它们被 强制固定 => 初值与约束语义冲突
+			// 所以作者选择了最安全的方式：参数语义变化 → 清空初始猜测 → 让优化器从约束本身解
 			if(_optimizeFromGraphEndChanged)
 			{
 				UWARN("Optimization: clearing guess poses as %s has changed state, now %s",
@@ -4151,6 +4251,11 @@ bool Rtabmap::process(
 			// 和 constraints（新的约束集合，可能包含新加入的 loop closures）。
 			std::multimap<int, Link> constraints;
 			cv::Mat covariance;
+			// 这是一个 高层封装函数，内部会：
+			// 1 从 Memory 中：取出当前可达子图, 收集所有约束（odom / loop / prior）
+			// 2 根据参数：决定 root 节点, 是否 optimize from end
+			// 3 调用：_graphOptimizer->optimize()
+			// 4 返回：新的 poses（即 _optimizedPoses）和 constraints（最终用于优化的边）
 			optimizeCurrentMap(signature->id(), false, poses, covariance, &constraints, &optimizationError, &optimizationIterations);
 
 			// Check added loop closures have broken the graph
@@ -5549,6 +5654,12 @@ std::map<int, std::map<int, Transform> > Rtabmap::getPaths(const std::map<int, T
 	return paths;
 }
 
+/**
+ * 以当前节点 id 为参考，找出与之连通的整张（或局部）图， 
+ * 根据 OptimizeFromGraphEnd 决定 root， 
+ * 调用 optimizeGraph() 做真正的 pose graph optimization， 
+ * 并把结果写回 optimizedPoses
+ */
 void Rtabmap::optimizeCurrentMap(
 		int id,
 		bool lookInDatabase,
@@ -5560,19 +5671,32 @@ void Rtabmap::optimizeCurrentMap(
 {
 	//Optimize the map
 	UINFO("Optimize map: around location %d (lookInDatabase=%s)", id, lookInDatabase?"true":"false");
+	// 必须有 memory（否则没图）
+	// id > 0：RTAB-Map 的合法 node id 从 1 开始; id<=0 表示无效输入
 	if(_memory && id > 0)
 	{
 		UTimer timer;
+		// 获取“连通图节点集合”（非常关键）
+		// id: 起始节点 
+		// 0: depth = 0 → 不限深度 
+		// lookInDatabase?-1:0: 是否从数据库加载老节点 
+		// true: include loop closures 
+		// false: 不只取邻接节点
 		std::map<int, int> ids = _memory->getNeighborsId(id, 0, lookInDatabase?-1:0, true, false);
+		// _optimizeFromGraphEnd == false 从图的起点优化 全图可动
+		// _optimizeFromGraphEnd == true root 仍是传入的 id（通常是最新节点） 历史节点近似固定
 		if(!_optimizeFromGraphEnd && ids.size() > 1)
 		{
+			// ids.begin()->first 是 最小 id = 最老的节点
 			id = ids.begin()->first;
 		}
 		UINFO("get %d ids time %f s", (int)ids.size(), timer.ticks());
 
+		// 真正的“核心调用”：optimizeGraph()
 		std::map<int, Transform> poses = Rtabmap::optimizeGraph(id, uKeysSet(ids), optimizedPoses, lookInDatabase, covariance, constraints, error, iterationsDone);
 		UINFO("optimize time %f s", timer.ticks());
 
+		// 优化成功后的处理
 		if(poses.size())
 		{
 			optimizedPoses = poses;
@@ -5583,6 +5707,7 @@ void Rtabmap::optimizeCurrentMap(
 				UINFO("Correction (from node %d) %s", id, t.prettyPrint().c_str());
 			}
 		}
+		// 失败就“全清”
 		else
 		{
 			UWARN("Failed to optimize the graph! returning empty optimized poses...");

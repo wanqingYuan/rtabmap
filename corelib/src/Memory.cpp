@@ -1935,15 +1935,25 @@ void Memory::clear()
  * Compute the likelihood of the signature with some others in the memory.
  * Important: Assuming that all other ids are under 'signature' id.
  * If an error occurs, the result is empty.
+ * 计算当前节点 signature 与若干候选节点 ids 之间的相似度（likelihood）
+ * 返回：map<节点ID, 相似度分数>
  */
 std::map<int, float> Memory::computeLikelihood(const Signature * signature, const std::list<int> & ids)
 {
+	// 两种计算模式（核心分支） _tfIdfLikelihoodUsed
+	// | 模式    | 方法                 | 特点          |
+	// | ----- | ---------------------- | ----------- |
+	// | false | Signature::compareTo() | 简单直接，慢，精度一般 |
+	// | true  | TF-IDF（词袋模型）      | 快，适合大规模     |
+
 	if(!_tfIdfLikelihoodUsed)
 	{
+		// 初始化与检查
 		UTimer timer;
 		timer.start();
 		std::map<int, float> likelihood;
 
+		// 异常处理
 		if(!signature)
 		{
 			ULOGGER_ERROR("The signature is null");
@@ -1955,6 +1965,7 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 			return likelihood;
 		}
 
+		// 逐个节点计算相似度
 		for(std::list<int>::const_iterator iter = ids.begin(); iter!=ids.end(); ++iter)
 		{
 			float sim = 0.0f;
@@ -1965,6 +1976,8 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 				{
 					UFATAL("Signature %d not found in WM ?!?", *iter);
 				}
+				// 比较两个 Signature 通常基于：
+				// SURF / ORB / SIFT 描述子, Bag-of-Words 或匹配数量
 				sim = signature->compareTo(*sB);
 			}
 
@@ -1976,6 +1989,8 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 	}
 	else
 	{
+		// 模式二：TF-IDF 外观相似度（主流）
+		// 这是 RTAB-Map 的默认/核心回环相似度计算方式。
 		UTimer timer;
 		timer.start();
 		std::map<int, float> likelihood;
@@ -1992,17 +2007,27 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 			return likelihood;
 		}
 
+		// 初始化 likelihood
 		for(std::list<int>::const_iterator iter = ids.begin(); iter!=ids.end(); ++iter)
 		{
 			likelihood.insert(likelihood.end(), std::pair<int, float>(*iter, 0.0f));
 		}
 
+		// 获取当前节点的词集合
 		const std::list<int> & wordIds = uUniqueKeys(signature->getWords());
 
-		float nwi; // nwi is the number of a specific word referenced by a place
-		float ni; // ni is the total of words referenced by a place
-		float nw; // nw is the number of places referenced by a specific word
-		float N; // N is the total number of places
+		// nwi is the number of a specific word referenced by a place
+		// 词 w 在地点 i 中出现次数
+		float nwi; 
+		// ni is the total of words referenced by a place
+		// 地点 i 中所有词的总数
+		float ni; 
+		// nw is the number of places referenced by a specific word
+		// 含有词 w 的地点数量
+		float nw; 
+		// N is the total number of places
+		// 地点总数
+		float N; 
 
 		float logNnw;
 		const VisualWord * vw;
@@ -2013,11 +2038,13 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 		{
 			UDEBUG("processing... ");
 			// Pour chaque mot dans la signature SURF
+			// 遍历每个词（核心）
 			for(std::list<int>::const_iterator i=wordIds.begin(); i!=wordIds.end(); ++i)
 			{
 				if(*i>0)
 				{
 					// "Inverted index" - Pour chaque endroit contenu dans chaque mot
+					// 倒排索引（Inverted Index）
 					vw = _vwd->getWord(*i);
 					UASSERT_MSG(vw!=0, uFormat("Word %d not found in dictionary!?", *i).c_str());
 
@@ -2025,9 +2052,12 @@ std::map<int, float> Memory::computeLikelihood(const Signature * signature, cons
 					nw = refs.size();
 					if(nw)
 					{
+						// 计算 IDF 项
+						// 出现越频繁的词 → 权重越小, 稀有词 → 权重大
 						logNnw = log10(N/nw);
 						if(logNnw)
 						{
+							// 遍历包含该词的所有地点
 							for(std::map<int, int>::const_iterator j=refs.begin(); j!=refs.end(); ++j)
 							{
 								std::map<int, float>::iterator iter = likelihood.find(j->first);
@@ -3519,15 +3549,26 @@ Transform Memory::computeIcpTransformMulti(
 	return t;
 }
 
+/**
+ * 在两个节点之间添加一条图约束（Link），并根据节点是否在内存或数据库中，正确维护双向链接、数据库同步，以及增量建图时的权重与回环状态。
+ * link ：两个节点之间的约束（位姿 + 协方差 + 类型）
+ * addInDatabase：若节点不在内存，是否写入数据库
+ */ 
 bool Memory::addLink(const Link & link, bool addInDatabase)
 {
+	// 前置合法性检查
+	// 禁止：邻接边（Neighbor）；未定义类型（Undef）
+	// 这里只处理 “高层约束”：回环（LoopClosure）；局部/全局空间约束；虚拟回环等
 	UASSERT(link.type() > Link::kNeighbor && link.type() != Link::kUndef);
 
 	ULOGGER_INFO("to=%d, from=%d transform: %s var=%f", link.to(), link.from(), link.transform().prettyPrint().c_str(), link.transVariance(false));
+	// 查找节点（Signature）：在 STM + WM 中查找，不查数据库
 	Signature * toS = _getSignature(link.to());
 	Signature * fromS = _getSignature(link.from());
+	// 情况一：两个节点都在内存中（最常见
 	if(toS && fromS)
 	{
+		// 避免重复加边
 		if(toS->hasLink(link.from()))
 		{
 			// do nothing, already merged
@@ -3537,17 +3578,22 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 
 		UDEBUG("Add link between %d and %d", toS->id(), fromS->id());
 
+		// 双向加边（非常重要）
 		toS->addLink(link.inverse());
 		fromS->addLink(link);
 
+		// 增量建图模式下的特殊处理
 		if(_incrementalMemory)
 		{
+			// 忽略虚拟回环
 			if(link.type()!=Link::kVirtualClosure)
 			{
 				_linksChanged = true;
 
 				// update weight
 				// ignore scan matching loop closures
+				// 更新最近的“全局回环 ID”
+				// 忽略 scan matching 局部回环 只记录真正的外观/全局回环
 				if(link.type() != Link::kLocalSpaceClosure ||
 				   link.userDataCompressed().empty())
 				{
@@ -3555,6 +3601,13 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 
 					// update weights only if the memory is incremental
 					// When reducing the graph, transfer weight to the oldest signature
+					// 权重（weight）转移机制（非常关键）
+					// 图合并时，只保留一个“代表节点”
+					// | 模式                 | 权重保留在哪 |
+					// | -------------------- | ------ |
+					// | _reduceGraph = true  | 较老节点   |
+					// | _reduceGraph = false | 较新节点   |
+
 					UASSERT(fromS->getWeight() >= 0 && toS->getWeight() >=0);
 					if((_reduceGraph && fromS->id() < toS->id()) ||
 					   (!_reduceGraph && fromS->id() > toS->id()))
@@ -3571,6 +3624,7 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 			}
 		}
 	}
+	// 情况二：节点不在内存，且禁止写数据库
 	else if(!addInDatabase)
 	{
 		if(!fromS)
@@ -3583,6 +3637,8 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 		}
 		return false;
 	}
+	// 情况三：一个在内存，一个在数据库
+	// 保证：内存节点有本地链接 数据库中有完整双向约束
 	else if(fromS)
 	{
 		UDEBUG("Add link between %d and %d (db)", link.from(), link.to());
@@ -3595,9 +3651,11 @@ bool Memory::addLink(const Link & link, bool addInDatabase)
 		_dbDriver->addLink(link);
 		toS->addLink(link.inverse());
 	}
+	// 情况四：两个都只在数据库中
 	else
 	{
 		UDEBUG("Add link between %d (db) and %d (db)", link.from(), link.to());
+		// 仅维护数据库一致性
 		_dbDriver->addLink(link);
 		_dbDriver->addLink(link.inverse());
 	}
@@ -3885,9 +3943,15 @@ unsigned long Memory::getMemoryUsed() const
 	return memoryUsage;
 }
 
+/**
+ * 将当前新加入的 Signature 与最近的一个有效 Signature 进行相似度比较，如果足够相似，就进行合并或权重更新，从而减少冗余记忆。
+ * Signature * signature   // 当前要处理的新记忆（节点）
+ * Statistics * stats      // 统计信息（可选，用于调试和性能分析）
+ */
 void Memory::rehearsal(Signature * signature, Statistics * stats)
 {
 	UTimer timer;
+	// 如果当前 Signature 是“坏的”（例如特征不足、传感器异常），直接返回
 	if(signature->isBadSignature())
 	{
 		return;
@@ -3895,30 +3959,41 @@ void Memory::rehearsal(Signature * signature, Statistics * stats)
 
 	//============================================================
 	// Compare with the last (not intermediate node)
+	// 找到最近的一个有效 Signature
 	//============================================================
 	Signature * sB = 0;
+	// _stMem 是存储 Signature ID 的集合（时间顺序）
+	// 从最近的记忆开始倒序遍历
 	for(std::set<int>::reverse_iterator iter=_stMem.rbegin(); iter!=_stMem.rend(); ++iter)
 	{
+		// 通过 ID 获取 Signature 确保不为空
 		Signature * s = this->_getSignature(*iter);
 		UASSERT(s!=0);
+		// weight >= 0：不是中间节点（intermediate node）
+		// 不能是当前自己
 		if(s->getWeight() >= 0 && s->id() != signature->id())
 		{
+			// 找到最近的一个合法 Signature，停止搜索
 			sB = s;
 			break;
 		}
 	}
+	// 如果找到对比对象，进行相似度比较
 	if(sB)
 	{
 		int id = sB->id();
 		UDEBUG("Comparing with signature (%d)...", id);
 
+		// 调用 compareTo() 计算两个 Signature 的相似度
 		float sim = signature->compareTo(*sB);
 
 		int merged = 0;
+		// 判断是否达到相似度阈值
 		if(sim >= _similarityThreshold)
 		{
 			if(_incrementalMemory)
 			{
+				// 将当前 signature 合并到旧的 signature（id）合并成功则记录合并到的节点 ID
 				if(this->rehearsalMerge(id, signature->id()))
 				{
 					merged = id;
@@ -3926,6 +4001,7 @@ void Memory::rehearsal(Signature * signature, Statistics * stats)
 			}
 			else
 			{
+				// 不合并节点 只是增加当前节点的权重,表示“这个记忆出现得更频繁”
 				signature->setWeight(signature->getWeight() + 1 + sB->getWeight());
 			}
 		}
