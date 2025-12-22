@@ -305,28 +305,40 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 	UASSERT_MSG(data.id() >= 0, uFormat("Input data should have ID greater or equal than 0 (id=%d)!", data.id()).c_str());
 
 	// cache imu data
+	// 判断是否需要同步处理 IMU
+	// 当前传感器数据里是否带有 IMU & 当前里程计模块 不支持异步 IMU 处理(默认为F2M 返回false)
 	if(!data.imu().empty() && !this->canProcessAsyncIMU())
 	{
+		// 判断 IMU 是否真的提供了 orientation
 		if(!(data.imu().orientation()[0] == 0.0 && data.imu().orientation()[1] == 0.0 && data.imu().orientation()[2] == 0.0))
 		{
+			// 构造 IMU 的姿态 Transform
 			Transform orientation(0,0,0, data.imu().orientation()[0], data.imu().orientation()[1], data.imu().orientation()[2], data.imu().orientation()[3]);
 			// orientation includes roll and pitch but not yaw in local transform
+			// 计算 IMU 在 base_link 下的姿态（关键）imuT = T_base←imu * R_imu * (T_base←imu)^-1
+			// yaw 的处理 不完全信任 IMU，yaw 通常由：视觉、ICP、scan matching、里程计 来估计
 			Transform imuT = Transform(data.imu().localTransform().x(),data.imu().localTransform().y(),data.imu().localTransform().z(), 0,0,data.imu().localTransform().theta()) *
 					orientation*
 					data.imu().localTransform().rotation().inverse();
 
+			// 只在“第一帧”用 IMU 修正初始位姿， framesProcessed() == 0 还没处理过任何帧
 			if(	this->getPose().r11() == 1.0f && this->getPose().r22() == 1.0f && this->getPose().r33() == 1.0f &&
 				this->framesProcessed() == 0)
 			{
 				Eigen::Quaterniond imuQuat = imuT.getQuaterniond();
 				Transform previous = this->getPose();
+				// 使用上一帧位置和当前帧imu位姿。实际上位置也是原点位置
 				Transform newFramePose = Transform(previous.x(), previous.y(), previous.z(), imuQuat.x(), imuQuat.y(), imuQuat.z(), imuQuat.w());
 				UWARN("Updated initial pose from %s to %s with IMU orientation", previous.prettyPrint().c_str(), newFramePose.prettyPrint().c_str());
 				std::map<double, rtabmap::Transform> imus = imus_;
+				// 重置里程计状态，把 IMU 提供的 roll / pitch 作为初始姿态，yaw 仍然保持 0（或后续估计）
+				// 更新了_pose
 				this->reset(newFramePose);
 				imus_ = imus;
 			}
 
+			// 保存 IMU 数据到缓存（关键）
+			// 后续模块会用它做：ICP 约束，视觉里程计约束，重力方向约束
 			imus_.insert(std::make_pair(data.stamp(), imuT));
 			if(imus_.size() > 1000)
 			{
@@ -339,6 +351,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		}
 	}
 
+	// 判断数据是否是压缩形式 → 解压 → 如果有图像数据则打印调试信息并准备处理
 	if((data.imageRaw().empty() && !data.imageCompressed().empty()) ||
 	   (data.depthOrRightRaw().empty() && !data.depthOrRightCompressed().empty()) ||
 	   (data.laserScanRaw().empty() && !data.laserScanCompressed().empty()))
@@ -348,6 +361,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		UDEBUG("Received compressed data, uncompressing...done!");
 	}
 
+	// 如果原始图像已经存在（无论是本来就有，还是刚刚解压得到）
 	if(!data.imageRaw().empty())
 	{
 		UDEBUG("Processing image data %dx%d: rgbd models=%ld, stereo models=%ld",
@@ -357,7 +371,8 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			data.stereoCameraModels().size());
 	}
 
-
+	// 当输入的是“未校正（未极线校正/去畸变）的原始图像”，而当前里程计方法又“不能直接处理原始图像”时，系统会尝试根据相机标定信息自动对图像进行校正（rectification），否则报错。
+	// _imagesAlreadyRectified 默认为true
 	if(!_imagesAlreadyRectified && !this->canProcessRawImages() && !data.imageRaw().empty())
 	{
 		if(!data.stereoCameraModels().empty())
@@ -502,8 +517,12 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 	}
 
 	// Ground alignment
+	// 常用于 SLAM 或里程计系统的初始化阶段，让机器人的坐标系与地面平面对齐，从而保证 Z 轴方向与重力方向一致。
+	// _pose 是零位姿：说明系统尚未初始化位姿
 	if(_pose.x() == 0 && _pose.y() == 0 && _pose.z() == 0 && this->framesProcessed() == 0 && _alignWithGround)
 	{
+		// 地面对齐需要 深度数据（点云）
+		// 如果没有深度信息，则无法进行对齐，打印警告并跳过
 		if(data.depthOrRightRaw().empty())
 		{
 			UWARN("\"%s\" is true but the input has no depth information, ignoring alignment with ground...", Parameters::kOdomAlignWithGround().c_str());
@@ -513,21 +532,35 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			UTimer alignTimer;
 			pcl::IndicesPtr indices(new std::vector<int>);
 			pcl::IndicesPtr ground, obstacles;
+			// cloudFromSensorData：将深度图或立体相机数据转成 PCL 点云
 			pcl::PointCloud<pcl::PointXYZ>::Ptr cloud = util3d::cloudFromSensorData(data, 1, 10, 0, indices.get());
 			bool success = false;
 			if(indices->size())
 			{
+				// 将点云体素化，点云稀疏化,目的是减少点数量，加快地面分割和拟合速度
+				// 参数 0.01 表示 体素大小 1 cm
 				cloud = util3d::voxelize(cloud, indices, 0.01);
+				// 前面imu初始化时已经更新了一次_pose，因此_pose不是单位矩阵
 				if(!_pose.isIdentity())
 				{
 					// In case we are already aligned with gravity
+					// 如果系统已有旋转信息（例如来自 IMU），将点云旋转到当前估计坐标系
 					cloud = util3d::transformPointCloud(cloud, _pose);
 				}
+				// 分割地面与障碍物，将点云分为 地面（ground） 和 障碍物（obstacles）
+				// 20：迭代次数或法线估计邻域大小 
+				// M_PI/4.0f：允许的最大倾斜角度（45°）
+				// 0.02：地面距离阈值 
+				// 200：最小地面点数 
+				// true：可能表示对点云做法线平滑
 				util3d::segmentObstaclesFromGround<pcl::PointXYZ>(cloud, ground, obstacles, 20, M_PI/4.0f, 0.02, 200, true);
 				if(ground->size())
 				{
+					// 拟合地面平面
+					// 平面方程：ax + by + cz + d = 0 存储在 coefficients.values [0]=a, [1]=b, [2]=c, [3]=d
 					pcl::ModelCoefficients coefficients;
 					util3d::extractPlane(cloud, ground, 0.02, 100, &coefficients);
+					// 判断是地面还是天花板，d >= 0 → 地面，d < 0 → 可能检测到了天花板
 					if(coefficients.values.at(3) >= 0)
 					{
 						UWARN("Ground detected! coefficients=(%f, %f, %f, %f) time=%fs",
@@ -546,11 +579,14 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 								coefficients.values.at(3),
 								alignTimer.ticks());
 					}
+					// 计算旋转矩阵使 Z 轴对齐地面法向量
 					Eigen::Vector3f n(coefficients.values.at(0), coefficients.values.at(1), coefficients.values.at(2));
 					Eigen::Vector3f z(0,0,1);
 					//get rotation from z to n;
 					Eigen::Matrix3f R;
+					// 计算旋转矩阵，使地面法向量旋转到 Z 方向
 					R = Eigen::Quaternionf().setFromTwoVectors(n,z);
+					// 旋转矩阵尚未设置 设置位姿旋转 + Z 偏移
 					if(_pose.r11() == 1.0f && _pose.r22() == 1.0f && _pose.r33() == 1.0f)
 					{
 						Transform rotation(
@@ -559,6 +595,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 								R(2,0), R(2,1), R(2,2), coefficients.values.at(3));
 						this->reset(rotation);
 					}
+					// 旋转已设置（例如来自 IMU）保留已有旋转，只更新 Z 偏移
 					else
 					{
 						// Rotation is already set (e.g., from IMU/gravity), just update Z
@@ -580,11 +617,20 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		}
 	}
 
-	// KITTI datasets start with stamp=0
+	// 这段代码处理的是 里程计（Odometry）中位姿预测（Motion Guess / Velocity Guess）和时间增量 dt 的管理，
+	// 通常用于视觉或激光里程计，用于提供 上一帧到当前帧的运动初值（初始位姿猜测），以及 Kalman 预测。
+
+	// 计算时间间隔 dt。KITTI 数据集从 stamp = 0 开始，所以要特殊处理第一帧 ，目的是保证 dt 是非负的有效时间间隔
 	double dt = previousStamp_>0.0f || (previousStamp_==0.0f && framesProcessed()==1)?data.stamp() - previousStamp_:0.0;
+	// 初始化预测位姿 guess
+	// guessFromMotion_：是否启用运动初值（上一帧运动推测）
+	// velocityGuess_：上一帧速度或运动估计
 	Transform guess = dt>0.0 && guessFromMotion_ && !velocityGuess_.isNull()?Transform::getIdentity():Transform();
+	// 检查 dt 是否有效
 	if(!(dt>0.0 || (dt == 0.0 && velocityGuess_.isNull())))
 	{
+		// 无效 dt 处理
+		// 打印错误提示
 		if(guessFromMotion_ && (!data.imageRaw().empty() || !data.laserScanRaw().isEmpty()))
 		{
 			UERROR("Guess from motion is set but dt is invalid! Odometry is then computed without guess. (dt=%f previous transform=%s)", dt, velocityGuess_.prettyPrint().c_str());
@@ -593,10 +639,12 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		{
 			UERROR("Kalman filtering is enabled but dt is invalid! Odometry is then computed without Kalman filtering. (dt=%f previous transform=%s)", dt, velocityGuess_.prettyPrint().c_str());
 		}
+		// 清空 速度猜测；将 dt 设置为 0；避免使用无效的预测进行里程计计算
 		dt=0;
 		previousVelocities_.clear();
 		velocityGuess_.setNull();
 	}
+	// 根据速度猜测更新预测位姿 guess
 	if(!velocityGuess_.isNull())
 	{
 		if(guessFromMotion_)
@@ -604,12 +652,16 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			if(_filteringStrategy == 1)
 			{
 				// use Kalman predict transform
+				// Kalman 滤波启用 (_filteringStrategy == 1)：
+				// 根据 dt 推算位移和旋转增量 → guess
 				float vx,vy,vz, vroll,vpitch,vyaw;
 				predictKalmanFilter(dt, &vx,&vy,&vz,&vroll,&vpitch,&vyaw);
 				guess = Transform(vx*dt, vy*dt, vz*dt, vroll*dt, vpitch*dt, vyaw*dt);
 			}
 			else
 			{
+				// 直接从 velocityGuess_ 获取速度/角速度
+				// 乘以 dt → 得到位姿增量 → guess
 				float vx,vy,vz, vroll,vpitch,vyaw;
 				velocityGuess_.getTranslationAndEulerAngles(vx,vy,vz, vroll,vpitch,vyaw);
 				guess = Transform(vx*dt, vy*dt, vz*dt, vroll*dt, vpitch*dt, vyaw*dt);
