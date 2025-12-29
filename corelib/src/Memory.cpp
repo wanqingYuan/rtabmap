@@ -922,9 +922,7 @@ bool Memory::update(
 
 	// It will be added to the short-term memory, no need to delete it...
 	// 将 Signature 加入 STM（短期记忆）,covariance 用于 odometry 不确定性。
-	// 只保存最新的 N 个 signature : _maxStMemSize
-	// 数据快速访问 : 用于回环候选计算
-	// 匹配、重定位的核心数据存放在此
+	// 这里会尝试建立邻接边（里程计约束）
 	this->addSignatureToStm(signature, covariance);
 
 	// 设置 lastSignature
@@ -1021,33 +1019,51 @@ bool Memory::update(
 	return true;
 }
 
+/**
+ * 将一个新的 Signature（节点 / 关键帧） 加入 短期记忆（STM, Short-Term Memory），并且：
+ * 与上一个 STM 节点建立 邻接约束（odometry link）
+ * 根据协方差计算 信息矩阵（information matrix）
+ * 更新图结构、标签、统计信息
+ */
 void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance)
 {
 	UTimer timer;
 	// add signature on top of the short-term memory
+	// 判空检查 + 日志
 	if(signature)
 	{
+		// 确保传入的节点不为空
+		// 打印当前节点 ID 和位姿
 		UDEBUG("adding %d (pose=%s)", signature->id(), signature->getPose().prettyPrint().c_str());
 		// Update neighbors
+		// 如果 STM 中已有节点 → 尝试建立邻接边,也就是：当前不是第一帧
 		if(_stMem.size())
 		{
+			// 判断是否在同一个地图（mapId）
 			if(_signatures.at(*_stMem.rbegin())->mapId() == signature->mapId())
 			{
+				// 计算相对运动（motionEstimate）
 				Transform motionEstimate;
+				// 位姿有效性检查
 				if(!signature->getPose().isNull() &&
 				   !_signatures.at(*_stMem.rbegin())->getPose().isNull())
 				{
+					// 协方差合法性断言
 					UASSERT(covariance.cols == 6 && covariance.rows == 6 && covariance.type() == CV_64FC1);
+					// 检查角度方差是否异常（非常重要）
 					double maxAngVar = 0.0;
+					// 如果是 3DoF 模式 → 只看 yaw
 					if(_registrationPipeline->force3DoF())
 					{
 						maxAngVar = covariance.at<double>(5,5);
 					}
+					// 否则取 roll / pitch / yaw 最大值
 					else
 					{
 						maxAngVar = uMax3(covariance.at<double>(3,3), covariance.at<double>(4,4), covariance.at<double>(5,5));
 					}
 
+					// 方差过大 → SLAM 图优化会变得很差
 					if(maxAngVar != 1.0 && maxAngVar > 0.1)
 					{
 						static bool warned = false;
@@ -1062,7 +1078,9 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 						}
 					}
 
+					// 由协方差计算信息矩阵（重点）
 					cv::Mat infMatrix;
+					// 是否忽略非对角项
 					if(_covOffDiagonalIgnored)
 					{
 						infMatrix = cv::Mat::zeros(6,6,CV_64FC1);
@@ -1073,10 +1091,12 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 						infMatrix.at<double>(4,4) = 1.0 / covariance.at<double>(4,4);
 						infMatrix.at<double>(5,5) = 1.0 / covariance.at<double>(5,5);
 					}
+					// 否则完整求逆
 					else
 					{
 						infMatrix = covariance.inv();
 					}
+					// 防止矩阵不可逆
 					if((uIsFinite(covariance.at<double>(0,0)) && covariance.at<double>(0,0)>0.0) &&
 						!(uIsFinite(infMatrix.at<double>(0,0)) && infMatrix.at<double>(0,0)>0.0))
 					{
@@ -1090,6 +1110,7 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 					{
 						_odomMaxInf.resize(6, 0.0);
 					}
+					// 更新里程计最大信息统计（用于归一化）用于后续图优化中的权重归一化
 					for(int i=0; i<6; ++i)
 					{
 						const double & v = infMatrix.at<double>(i,i);
@@ -1099,10 +1120,12 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 						}
 					}
 
+					// 计算相对位姿 & 建立双向邻接边
 					motionEstimate = _signatures.at(*_stMem.rbegin())->getPose().inverse() * signature->getPose();
 					_signatures.at(*_stMem.rbegin())->addLink(Link(*_stMem.rbegin(), signature->id(), Link::kNeighbor, motionEstimate, infMatrix));
 					signature->addLink(Link(signature->id(), *_stMem.rbegin(), Link::kNeighbor, motionEstimate.inverse(), infMatrix));
 				}
+				// 如果任意一方位姿无效 → 用空 Transform
 				else
 				{
 					_signatures.at(*_stMem.rbegin())->addLink(Link(*_stMem.rbegin(), signature->id(), Link::kNeighbor, Transform()));
@@ -1141,8 +1164,10 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 			}
 		}
 
+		// 插入到系统结构中（真正加入 STM）
 		_signatures.insert(_signatures.end(), std::pair<int, Signature *>(signature->id(), signature));
 		_stMem.insert(_stMem.end(), signature->id());
+		// 记录 Ground Truth（如果有）
 		if(!signature->getGroundTruthPose().isNull()) {
 			_groundTruths.insert(std::make_pair(signature->id(), signature->getGroundTruthPose()));
 		}
@@ -1152,6 +1177,7 @@ void Memory::addSignatureToStm(Signature * signature, const cv::Mat & covariance
 		{
 			UDEBUG("%d words ref for the signature %d (weight=%d)", signature->getWords().size(), signature->id(), signature->getWeight());
 		}
+		// 处理词袋（BoW）
 		if(signature->getWords().size())
 		{
 			signature->setEnabled(true);
@@ -4712,21 +4738,37 @@ private:
 	VWDictionary * _vwp;
 };
 
+/**
+ * 把“当前传感器数据 + 当前位姿估计”，封装成一个可以放进 SLAM 图里的节点（Signature）。
+ * 它本身 不做优化、不做回环、不做 BA，只负责：整理数据 & 生成节点 & 建立“候选约束（links）” & 为后续图优化打基础
+ * pose: odomPose 或者 Transform()
+ * signature: 本质上是SLAM中的一个节点, 结构如下:
+ * id	节点编号
+ * weight	是否是中间节点 intermediate
+ * pose	当前对世界的位姿
+ * sensorData	原始/压缩传感器数据
+ * words	视觉词袋
+ * links	与其他节点的约束
+ */
 Signature * Memory::createSignature(const SensorData & inputData, const Transform & pose, Statistics * stats)
 {
+	// 1 把传进来的 SensorData 整理成一个“后面所有视觉/激光算法都能安全使用的状态”。
 	UDEBUG("");
+	// 复制输入数据（避免副作用）
 	SensorData data = inputData;
-
+	// 判断是否是 intermediate node
 	bool isIntermediateNode = data.id() < 0;
 
 	// uncompress data if needed
-	
+	// 只对“正式节点”做数据准备
 	if(!isIntermediateNode)
 	{
 		// We need raw images if we need to extract features and/or do tag detection
-		bool needRawImages = _feature2D->getMaxFeatures() >= 0 && 
-			(!_useOdometryFeatures ||
-			 data.keypoints().empty() ||
+		// 判断是否需要“原始图像”
+		// _feature2D->getMaxFeatures() 判断是否需要提取特征？>= 0：启用特征提取 < 0：禁用视觉特征（纯激光等）
+		bool needRawImages = _feature2D->getMaxFeatures() >= 0 &&  
+			(!_useOdometryFeatures || // 不用 odom 特征
+			 data.keypoints().empty() ||  // 没有 keypoints
 			 (int)data.keypoints().size() != data.descriptors().rows ||
 			 data.descriptors().empty() ||
 			 _detectMarkers ||
@@ -4736,8 +4778,11 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 
 		// Note: we could avoid uncompressing scan if we don't do any filtering
 		// and if we don't use it for local occupancy grid
+		// 是否需要“原始激光扫描”
+		// 这里直接设为 true，原因是：激光过滤, ICP, 局部占据栅格 几乎都需要 raw scan
 		bool needRawScan = true;
 
+		// 判断是否需要解压数据
 		if( (needRawImages && data.imageRaw().empty() && !data.imageCompressed().empty()) ||
 			(needRawImages && data.depthOrRightRaw().empty() && !data.depthOrRightCompressed().empty()) ||
 			(needRawScan && data.laserScanRaw().empty() && !data.laserScanCompressed().empty()))
@@ -4745,6 +4790,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			cv::Mat left, right;
 			LaserScan laserScan;
 			UDEBUG("Uncompressing data...");
+			// 执行解压
 			data.uncompressData(
 				needRawImages && data.imageRaw().empty() && !data.imageCompressed().empty() ? &left : 0,
 				needRawImages && data.depthOrRightRaw().empty() && !data.depthOrRightCompressed().empty() ? &right : 0,
@@ -4753,9 +4799,12 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		}
 	}
 
+	// 图像类型合法性检查（强约束）
 	UASSERT(data.imageRaw().empty() ||
 			data.imageRaw().type() == CV_8UC1 ||
 			data.imageRaw().type() == CV_8UC3);
+	// 深度 / 右图合法性检查（非常严格）
+	// 合法类型 && 合法尺寸
 	UASSERT_MSG(data.depthOrRightRaw().empty() ||
 			(  ( data.depthOrRightRaw().type() == CV_16UC1 ||
 				 data.depthOrRightRaw().type() == CV_32FC1 ||
@@ -4777,6 +4826,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 						data.depthOrRightRaw().type(),
 						CV_16UC1, CV_32FC1, CV_8UC1, CV_8UC3).c_str());
 
+	// 检查相机标定是否存在
+	// 必须要有相机内参才可以进行后续流程
 	if(!data.depthOrRightRaw().empty() &&
 		data.cameraModels().empty() &&
 		data.stereoCameraModels().empty() &&
@@ -4785,22 +4836,32 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UERROR("No camera calibration found, calibrate your camera!");
 		return 0;
 	}
-	UASSERT(_feature2D != 0);
+	// 2 把“合法的 SensorData”变成“可用于特征提取和词袋更新的标准输入状态”。
 
+	// 确保特征提取器存在
+	UASSERT(_feature2D != 0);
+	// 创建词典预更新线程（但还没启动）
+	// 后面要往词袋里插入新词, 这个线程用于 并行维护词典结构
 	PreUpdateThread preUpdateThread(_vwd);
 
+	// 初始化计时器 & 特征容器
 	UTimer timer;
 	timer.start();
 	float t;
 	std::vector<cv::KeyPoint> keypoints;
 	cv::Mat descriptors;
+	// 图像 ID 管理
 	int id = data.id();
+	// 如果系统负责生成 ID
 	if(_generateIds)
 	{
 		id = this->getNextId();
 	}
 	else
 	{
+		// 否则，严格校验输入 ID
+		// 这里强制保证：ID > 0 & 严格递增 & 不允许乱序帧
+		// 这是保证图结构不混乱的底线
 		if(id <= 0)
 		{
 			UERROR("Received image ID is null. "
@@ -4825,16 +4886,21 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		}
 	}
 
+	// 3 判断图像是否已校正（rectified）
 	bool imagesRectified = _imagesAlreadyRectified;
 	// Stereo must be always rectified because of the stereo correspondence approach
+	// 是否需要进行 rectification？立体匹配依赖极线几何，必须校正
+	// !imagesRectified & 有原始图像 && 不是“只校正特征”的特殊情况
 	if(!imagesRectified && !data.imageRaw().empty() && !(_rectifyOnlyFeatures && data.rightRaw().empty()))
 	{
 		// we assume that once rtabmap is receiving data, the calibration won't change over time
+		// 单目 / 多目 RGB-D 校正流程
 		if(data.cameraModels().size())
 		{
 			UDEBUG("Monocular rectification");
 			// Note that only RGB image is rectified, the depth image is assumed to be already registered to rectified RGB camera.
 			UASSERT(int((data.imageRaw().cols/data.cameraModels().size())*data.cameraModels().size()) == data.imageRaw().cols);
+			// 子图宽度计算 => 说明多相机图像是 横向拼接的
 			int subImageWidth = data.imageRaw().cols/data.cameraModels().size();
 			cv::Mat rectifiedImages(data.imageRaw().size(), data.imageRaw().type());
 			bool initRectMaps = _rectCameraModels.empty();
@@ -4849,15 +4915,18 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					if(initRectMaps)
 					{
 						_rectCameraModels[i] = data.cameraModels()[i];
+						// 初始化 rectification maps（只做一次）
 						if(!_rectCameraModels[i].isRectificationMapInitialized())
 						{
 							UWARN("Initializing rectification maps for camera %d (only done for the first image received)...", i);
+							// 去畸变映射只算一次, 后续帧复用
 							_rectCameraModels[i].initRectificationMap();
 							UWARN("Initializing rectification maps for camera %d (only done for the first image received)... done!", i);
 						}
 					}
 					UASSERT(_rectCameraModels[i].imageWidth() == data.cameraModels()[i].imageWidth() &&
 							_rectCameraModels[i].imageHeight() == data.cameraModels()[i].imageHeight());
+					// 真正的图像校正
 					cv::Mat rectifiedImage = _rectCameraModels[i].rectifyImage(cv::Mat(data.imageRaw(), cv::Rect(subImageWidth*i, 0, subImageWidth, data.imageRaw().rows)));
 					rectifiedImage.copyTo(cv::Mat(rectifiedImages, cv::Rect(subImageWidth*i, 0, subImageWidth, data.imageRaw().rows)));
 					imagesRectified = true;
@@ -4872,13 +4941,16 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					return 0;
 				}
 			}
+			// 更新 SensorData
 			data.setRGBDImage(rectifiedImages, data.depthOrRightRaw(), data.cameraModels());
 		}
+		// 立体相机（Stereo）校正流程
 		else if(data.stereoCameraModels().size())
 		{
 			UDEBUG("Stereo rectification");
 			UASSERT(int((data.imageRaw().cols/data.stereoCameraModels().size())*data.stereoCameraModels().size()) == data.imageRaw().cols);
 			int subImageWidth = data.imageRaw().cols/data.stereoCameraModels().size();
+			// 左右图必须尺寸严格匹配。
 			UASSERT(subImageWidth == data.rightRaw().cols/(int)data.stereoCameraModels().size());
 			cv::Mat rectifiedLefts(data.imageRaw().size(), data.imageRaw().type());
 			cv::Mat rectifiedRights(data.rightRaw().size(), data.rightRaw().type());
@@ -4921,7 +4993,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					return 0;
 				}
 			}
-
+			// 更新 SensorData
 			data.setStereoImage(
 					rectifiedLefts,
 					rectifiedRights,
@@ -4934,28 +5006,36 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					Parameters::kRtabmapImagesAlreadyRectified().c_str());
 			return 0;
 		}
+		// rectification 性能统计
 		t = timer.ticks();
 		if(stats) stats->addStatistic(Statistics::kTimingMemRectification(), t*1000.0f);
 		UDEBUG("time rectification = %fs", t);
 	}
-
+	// 计算词袋统计信息
 	int treeSize= int(_workingMem.size() + _stMem.size());
+	// 平均每个节点的特征数, 用于：控制词袋增长, 决定新词是否加入字典, 防止词典膨胀
 	int meanWordsPerLocation = _feature2D->getMaxFeatures()>0?_feature2D->getMaxFeatures():0;
 	if(treeSize > 1)
 	{
 		meanWordsPerLocation = _vwd->getTotalActiveReferences() / (treeSize-1); // ignore virtual signature
 	}
-
+	// 启动并行词典更新线程
 	if(_parallelized && !isIntermediateNode)
 	{
 		UDEBUG("Start dictionary update thread");
 		preUpdateThread.start();
 	}
 
+	// 4 这段代码负责 “自动把倒置的 RGB / RGB-D 图像旋转到正向（upside-up）”，并且保证多相机/多目情况下几何与数据一致性。
+	// 它在 createSignature() 中的位置非常讲究：发生在特征提取之前，必要时会强制清空已有特征，以避免使用“方向错误”的特征。
+	// _rotateImagesUpsideUp 的作用：自动检测并修正图像方向，同时更新 CameraModel。
+	// 启用了该功能 & 必须是 RGB 或 RGB-D & 必须有 CameraModel & Stereo 不支持
 	if(_rotateImagesUpsideUp && !data.imageRaw().empty() && !data.cameraModels().empty())
 	{
 		// Currently stereo is not supported
+		// stereo 旋转需要：左右图同步旋转 & 极线几何重新验证 & 实现复杂且容易出错 => RTAB-Map 直接禁止
 		UASSERT(int((data.imageRaw().cols/data.cameraModels().size())*data.cameraModels().size()) == data.imageRaw().cols);
+		// 多相机 RGB-D 被 横向拼接, 每个 camera 占一个子图, 后面所有操作都是 对每个子相机独立进行
 		int subInputImageWidth = data.imageRaw().cols/data.cameraModels().size();
 		int subInputDepthWidth = data.depthRaw().cols/data.cameraModels().size();
 		int subOutputImageWidth = 0;
@@ -4965,13 +5045,21 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		std::vector<CameraModel> rotatedCameraModels;
 		bool allOutputSizesAreOkay = true;
 		bool atLeastOneCameraRotated = false;
+		// 逐相机旋转流程（核心循环）
 		for(size_t i=0; i<data.cameraModels().size(); ++i)
 		{
 			UDEBUG("Rotating camera %ld", i);
+			// 提取子图
 			cv::Mat rgb = cv::Mat(data.imageRaw(), cv::Rect(subInputImageWidth*i, 0, subInputImageWidth, data.imageRaw().rows));
 			cv::Mat depth = !data.depthRaw().empty()?cv::Mat(data.depthRaw(), cv::Rect(subInputDepthWidth*i, 0, subInputDepthWidth, data.depthRaw().rows)):cv::Mat();
 			CameraModel model = data.cameraModels()[i];
+			// 自动判断并旋转（关键函数）
+			// 这个函数会：判断 CameraModel 的姿态 / 重力方向
+			// 如果需要：旋转 RGB & 旋转 Depth & 同步更新 CameraModel 内参/外参
+			// 返回：是否真的发生了旋转 => 不是盲转，是“必要时才转”
 			atLeastOneCameraRotated |= util2d::rotateImagesUpsideUpIfNecessary(model, rgb, depth);
+			// 初始化输出大图（第一次循环）
+			// 确保：所有相机输出尺寸必须一致, 否则无法拼接
 			if(rotatedColorImages.empty())
 			{
 				rotatedColorImages = cv::Mat(cv::Size(rgb.cols * data.cameraModels().size(), rgb.rows), rgb.type());
@@ -4982,6 +5070,9 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					subOutputDepthWidth = depth.cols;
 				}
 			}
+			// 尺寸一致性检查（非常重要）
+			// 当前相机输出尺寸 != 第一相机输出尺寸
+			// 一旦有一个不一致，整个旋转流程放弃
 			else if(rgb.cols != subOutputImageWidth || depth.cols != subOutputDepthWidth ||
 					rgb.rows != rotatedColorImages.rows || depth.rows != rotatedDepthImages.rows)
 			{
@@ -5005,15 +5096,21 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			}
 			rotatedCameraModels.push_back(model);
 		}
+		// 旋转结果是否生效？
 		if(allOutputSizesAreOkay && atLeastOneCameraRotated)
 		{
+			// 生效时做的三件事
+			// ️1 更新 SensorData
 			data.setRGBDImage(rotatedColorImages, rotatedDepthImages, rotatedCameraModels);
 
 			// Clear any features to avoid confusion with the rotated cameras.
+			// 2 清空已有特征（非常关键）
 			if(!data.keypoints().empty() || !data.keypoints3D().empty() || !data.descriptors().empty())
 			{
 				if(_useOdometryFeatures)
 				{
+					// 3 对 useOdometryFeatures 的处理（重要细节）
+					// 给一次 warning & 强制重新生成特征
 					static bool warned = false;
 					if(!warned)
 					{
@@ -5043,19 +5140,25 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		}
 	}
 
+	// 5 这段代码是 RTAB-Map 在 createSignature() 中“特征生成 + 3D 投影”的核心主体
+	// 决定是否复用里程计特征，是否降采样图像，然后生成 / 校正 / 过滤 2D 特征、描述子和 3D 特征点
 	unsigned int preDecimation = 1;
 	std::vector<cv::Point3f> keypoints3D;
 	SensorData decimatedData;
 	UDEBUG("Received kpts=%d kpts3D=%d, descriptors=%d _useOdometryFeatures=%s",
 			(int)data.keypoints().size(), (int)data.keypoints3D().size(), data.descriptors().rows, _useOdometryFeatures?"true":"false");
-	if(!_useOdometryFeatures ||
-		data.keypoints().empty() ||
-		(int)data.keypoints().size() != data.descriptors().rows ||
-		(_feature2D->getType() == Feature2D::kFeatureOrbOctree && data.descriptors().empty()))
+	// 第一层决策：是否“重新提特征”
+	if(!_useOdometryFeatures ||  // 不使用里程计特征, 强制自己算
+		data.keypoints().empty() ||  // 没有提供 keypoints, 无法复用
+		(int)data.keypoints().size() != data.descriptors().rows ||  // keypoints ≠ descriptors, 数据不一致
+		(_feature2D->getType() == Feature2D::kFeatureOrbOctree && data.descriptors().empty()))  // ORB-OCTREE 无描述子, 算法要求
 	{
+		// 第二层门槛：是否具备提特征的条件
+		// 中间节点（intermediate node）不提特征 & 必须有 RGB & 特征数 ≥ 0（=0 也合法）
 		if(_feature2D->getMaxFeatures() >= 0 && !data.imageRaw().empty() && !isIntermediateNode)
 		{
 			decimatedData = data;
+			// 图像预降采样（pre-decimation）
 			if(_imagePreDecimation > 1)
 			{
 				preDecimation = _imagePreDecimation;
@@ -5065,6 +5168,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					data.cameraModels()[0].imageWidth()>0)
 				{
 					// decimate from RGB image size
+					// RGB 与 Depth 可能用不同降采样率
+					// 让降采样后的 RGB 与 Depth 在“投影尺度”上对齐
 					int targetSize = data.cameraModels()[0].imageHeight() / _imagePreDecimation;
 					if(targetSize >= data.depthRaw().rows)
 					{
@@ -5078,11 +5183,13 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				}
 				UDEBUG("decimation rgbOrLeft(rows=%d)=%d, depthOrRight(rows=%d)=%d (conf? %d)", data.imageRaw().rows, _imagePreDecimation, data.depthOrRightRaw().rows, decimationDepth, data.depthConfidenceRaw().empty()?0:1);
 
+				// CameraModel 必须同步缩放（非常关键）
 				std::vector<CameraModel> cameraModels = decimatedData.cameraModels();
 				for(unsigned int i=0; i<cameraModels.size(); ++i)
 				{
 					cameraModels[i] = cameraModels[i].scaled(1.0/double(_imagePreDecimation));
 				}
+				// Stereo / RGB-D 两条路径
 				if(!cameraModels.empty())
 				{
 					decimatedData.setRGBDImage(
@@ -5108,6 +5215,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 
 			UINFO("Extract features");
 			cv::Mat imageMono;
+			// 转灰度（所有特征算法的统一入口）
 			if(decimatedData.imageRaw().channels() == 3)
 			{
 				cv::cvtColor(decimatedData.imageRaw(), imageMono, CV_BGR2GRAY);
@@ -5117,6 +5225,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				imageMono = decimatedData.imageRaw();
 			}
 
+			// Depth Mask（用深度约束特征区域）
+			// 只在 有深度的像素区域 提特征, 可选：地面剔除（_maskFloorThreshold）
 			cv::Mat depthMask;
 			if(imagesRectified && !decimatedData.depthRaw().empty() && _depthAsMask)
 			{
@@ -5154,17 +5264,20 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 							Parameters::kMemImagePreDecimation().c_str(), _imagePreDecimation);
 				}
 			}
-
+			// 是否复用里程计给的 keypoints
 			bool useProvided3dPoints = false;
 			if(_useOdometryFeatures && !data.keypoints().empty())
 			{
 				UDEBUG("Using provided keypoints (%d)", (int)data.keypoints().size());
+				// 情况 A：复用 2D 特征点
 				keypoints = data.keypoints();
                 
                 useProvided3dPoints = keypoints.size() == data.keypoints3D().size();
                 
                 // A: Adjust keypoint position so that descriptors are correctly extracted
+				// 预降采样后，必须修正 keypoint 坐标, 否则：描述子在错误尺度上计算
                 // B: In case we provided corresponding 3D features
+				// 如果提供了 3D 点, 用 class_id 建立 2D ↔ 3D 索引映射
                 if(_imagePreDecimation > 1 || useProvided3dPoints)
                 {
                     float decimationRatio = 1.0f / float(_imagePreDecimation);
@@ -5186,10 +5299,13 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
                     }
                 }
 			}
+			// 否则：自己检测关键点
 			else
 			{
 				int oldMaxFeatures = _feature2D->getMaxFeatures();
 				UDEBUG("rawDescriptorsKept=%d, pose=%d, maxFeatures=%d, visMaxFeatures=%d", _rawDescriptorsKept?1:0, pose.isNull()?0:1, _feature2D->getMaxFeatures(), _visMaxFeatures);
+				// 动态调整 maxFeatures
+				// 让位姿估计用到的特征数 = 地图中保留的特征数
 				ParametersMap tmpMaxFeatureParameter;
 				if(_rawDescriptorsKept&&!pose.isNull()&&_feature2D->getMaxFeatures()>0&&_feature2D->getMaxFeatures()<_visMaxFeatures)
 				{
@@ -5198,11 +5314,12 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					tmpMaxFeatureParameter.insert(ParametersPair(Parameters::kKpMaxFeatures(), uNumber2Str(_visMaxFeatures)));
 					_feature2D->parseParameters(tmpMaxFeatureParameter);
 				}
-
+				// 生成关键点
 				keypoints = _feature2D->generateKeypoints(
 						imageMono,
 						depthMask);
 
+				// 结束后立刻恢复参数
 				if(tmpMaxFeatureParameter.size())
 				{
 					tmpMaxFeatureParameter.at(Parameters::kKpMaxFeatures()) = uNumber2Str(oldMaxFeatures);
@@ -5213,18 +5330,22 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				UDEBUG("time keypoints (%d) = %fs", (int)keypoints.size(), t);
 			}
 
+			// 描述子生成 + 坏节点过滤
 			descriptors = _feature2D->generateDescriptors(imageMono, keypoints);
 			t = timer.ticks();
 			if(stats) stats->addStatistic(Statistics::kTimingMemDescriptors_extraction(), t*1000.0f);
 			UDEBUG("time descriptors (%d) = %fs", descriptors.rows, t);
 
 			UDEBUG("ratio=%f, meanWordsPerLocation=%d", _badSignRatio, meanWordsPerLocation);
+			// 坏签名检测
 			if(descriptors.rows && descriptors.rows < _badSignRatio * float(meanWordsPerLocation))
 			{
+				// 特征太少 → 直接丢弃（认为是坏帧）
 				descriptors = cv::Mat();
 			}
 			else
 			{
+				// 关键步骤：去畸变（undistortion）
 				if(!imagesRectified && decimatedData.cameraModels().size())
 				{
 					UASSERT_MSG((int)keypoints.size() == descriptors.rows, uFormat("%d vs %d", (int)keypoints.size(), descriptors.rows).c_str());
@@ -5234,6 +5355,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					descriptorsValid.reserve(descriptors.rows);
 
 					//undistort keypoints before projection (RGB-D)
+					// 单相机 过滤掉：去畸变后跑出图像范围的点
 					if(decimatedData.cameraModels().size() == 1)
 					{
 						std::vector<cv::Point2f> pointsIn, pointsOut;
@@ -5283,6 +5405,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					}
 					else
 					{
+						// 多相机拼接（非常重要）
+						// 每个 keypoint 对应一个 camera, 局部去畸变, 再加回拼接偏移
 						UASSERT(int((decimatedData.imageRaw().cols/decimatedData.cameraModels().size())*decimatedData.cameraModels().size()) == decimatedData.imageRaw().cols);
 						float subImageWidth = decimatedData.imageRaw().cols/decimatedData.cameraModels().size();
 						for(unsigned int i=0; i<keypoints.size(); ++i)
@@ -5344,6 +5468,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					UDEBUG("time rectification = %fs", t);
 				}
 
+				// D 特征点生成（三种来源）
 				if(useProvided3dPoints && keypoints.size() != data.keypoints3D().size())
 				{
 					UDEBUG("Using provided 3d points (%d->%d)", (int)data.keypoints3D().size(), (int)keypoints.size());
@@ -5367,12 +5492,14 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					if(stats) stats->addStatistic(Statistics::kTimingMemKeypoints_3D(), t*1000.0f);
 					UDEBUG("time keypoints 3D (%d) = %fs", (int)keypoints3D.size(), t);
 				}
+				// 最终深度过滤（兜底）
 				if(depthMask.empty() && (_feature2D->getMinDepth() > 0.0f || _feature2D->getMaxDepth() > 0.0f))
 				{
 					_feature2D->filterKeypointsByDepth(keypoints, descriptors, keypoints3D, _feature2D->getMinDepth(), _feature2D->getMaxDepth());
 				}
 			}
 		}
+		// 不具备提取特征的条件
 		else if(data.imageRaw().empty())
 		{
 			UDEBUG("Empty image, cannot extract features...");
@@ -5386,25 +5513,37 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			UDEBUG("Intermediate node detected, don't extract features!");
 		}
 	}
+	// getMaxFeatures() >= 0，允许使用特征（0 或正数，-1 通常表示禁用）& 不是中间节点（中间节点通常不保留特征）
+	// 不需要重新提取特征，允许直接使用里程计阶段计算的特征
 	else if(_feature2D->getMaxFeatures() >= 0 && !isIntermediateNode)
 	{
+		// 在满足条件时，直接复用里程计（odometry）阶段已经提取好的 2D 特征、3D 点和描述子，并在必要时做裁剪、去畸变、补充描述子和 3D 信息。
 		UINFO("Use odometry features: kpts=%d 3d=%d desc=%d (dim=%d, type=%d)",
 				(int)data.keypoints().size(),
 				(int)data.keypoints3D().size(),
 				data.descriptors().rows,
 				data.descriptors().cols,
 				data.descriptors().type());
+		// 直接使用里程计特征数据
 		keypoints = data.keypoints();
 		keypoints3D = data.keypoints3D();
 		descriptors = data.descriptors().clone();
 
+		// 一致性检查：防止数据损坏
 		UASSERT(descriptors.empty() || descriptors.rows == (int)keypoints.size());
 		UASSERT(keypoints3D.empty() || keypoints3D.size() == keypoints.size());
 
+		// 限制特征点数量
+		// 如果：保留原始描述子 _rawDescriptorsKept & 位姿有效 !pose.isNull() & 设置了 maxFeatures
+		// 那么：使用 max(_feature2D->getMaxFeatures(), _visMaxFeatures) 保证可视化和建图都有足够的特征点
 		int maxFeatures = _rawDescriptorsKept&&!pose.isNull()&&_feature2D->getMaxFeatures()>0&&_feature2D->getMaxFeatures()<_visMaxFeatures?_visMaxFeatures:_feature2D->getMaxFeatures();
+		// 使用 SSC 或普通裁剪
 		bool ssc = _rawDescriptorsKept&&!pose.isNull()&&_feature2D->getMaxFeatures()>0&&_feature2D->getMaxFeatures()<_visMaxFeatures?_visSSC:_feature2D->getSSC();
 		if((int)keypoints.size() > maxFeatures)
 		{
+			// 单目 / 双目：使用图像尺寸，空间均匀裁剪
+			// 多相机：仅数量裁剪
+			// 防止特征点集中在局部区域
 			if(data.cameraModels().size()==1 || data.stereoCameraModels().size()==1)
 				_feature2D->limitKeypoints(keypoints, keypoints3D, descriptors, maxFeatures, data.cameraModels().size()?data.cameraModels()[0].imageSize():data.stereoCameraModels()[0].left().imageSize(), ssc);
 			else
@@ -5414,8 +5553,10 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		if(stats) stats->addStatistic(Statistics::kTimingMemKeypoints_detection(), t*1000.0f);
 		UDEBUG("time keypoints (%d) = %fs", (int)keypoints.size(), t);
 
+		// 如果没有描述子 → 重新生成
 		if(descriptors.empty())
 		{
+			// 1 转灰度图
 			cv::Mat imageMono;
 			if(data.imageRaw().channels() == 3)
 			{
@@ -5426,9 +5567,12 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				imageMono = data.imageRaw();
 			}
 
+			// 2 强制要求图像已去畸变
 			UASSERT_MSG(imagesRectified, "Cannot extract descriptors on not rectified image from keypoints which assumed to be undistorted");
+			// 3 重新提取描述子. 关键点来自里程计，但描述子缺失时补上
 			descriptors = _feature2D->generateDescriptors(imageMono, keypoints);
 		}
+		// 关键点去畸变（重要！）
 		else if(!imagesRectified && !data.cameraModels().empty())
 		{
 			std::vector<cv::KeyPoint> keypointsValid;
@@ -5439,6 +5583,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			keypoints3DValid.reserve(keypoints3D.size());
 
 			//undistort keypoints before projection (RGB-D)
+			// 单相机 / RGB-D
 			if(data.cameraModels().size() == 1)
 			{
 				std::vector<cv::Point2f> pointsIn, pointsOut;
@@ -5446,7 +5591,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				if(data.cameraModels()[0].D_raw().cols == 6)
 				{
 #if CV_MAJOR_VERSION > 2 or (CV_MAJOR_VERSION == 2 and (CV_MINOR_VERSION >4 or (CV_MINOR_VERSION == 4 and CV_SUBMINOR_VERSION >=10)))
-					// Equidistant / FishEye
+					// Equidistant / FishEye 鱼眼
 					// get only k parameters (k1,k2,p1,p2,k3,k4)
 					cv::Mat D(1, 4, CV_64FC1);
 					D.at<double>(0,0) = data.cameraModels()[0].D_raw().at<double>(0,0);
@@ -5474,11 +5619,13 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 							data.cameraModels()[0].P());
 				}
 				UASSERT(pointsOut.size() == keypoints.size());
+				// 只保留：去畸变后仍在图像范围内的点
 				for(unsigned int i=0; i<pointsOut.size(); ++i)
 				{
 					if(pointsOut.at(i).x>=0 && pointsOut.at(i).x<data.cameraModels()[0].imageWidth() &&
 					   pointsOut.at(i).y>=0 && pointsOut.at(i).y<data.cameraModels()[0].imageHeight())
 					{
+						// 同步更新：
 						keypointsValid.push_back(keypoints.at(i));
 						keypointsValid.back().pt.x = pointsOut.at(i).x;
 						keypointsValid.back().pt.y = pointsOut.at(i).y;
@@ -5490,6 +5637,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					}
 				}
 			}
+			// 多相机拼接图像
 			else
 			{
 				float subImageWidth;
@@ -5571,12 +5719,14 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		if(stats) stats->addStatistic(Statistics::kTimingMemDescriptors_extraction(), t*1000.0f);
 		UDEBUG("time descriptors (%d) = %fs", descriptors.rows, t);
 
+		// 补充 3D 特征点（如果缺失）
 		if(keypoints3D.empty() &&
 			((!data.depthRaw().empty() && data.cameraModels().size() && data.cameraModels()[0].isValidForProjection()) ||
 		   (!data.rightRaw().empty() && data.stereoCameraModels().size() && data.stereoCameraModels()[0].isValidForProjection())))
 		{
 			keypoints3D = _feature2D->generateKeypoints3D(data, keypoints);
 		}
+		// 按深度范围过滤特征
 		if(_feature2D->getMinDepth() > 0.0f || _feature2D->getMaxDepth() > 0.0f)
 		{
 			_feature2D->filterKeypointsByDepth(keypoints, descriptors, keypoints3D, _feature2D->getMinDepth(), _feature2D->getMaxDepth());
@@ -5586,6 +5736,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UDEBUG("time keypoints 3D (%d) = %fs", (int)keypoints3D.size(), t);
 
 		UDEBUG("ratio=%f, meanWordsPerLocation=%d", _badSignRatio, meanWordsPerLocation);
+		// 如果当前帧特征数 远小于正常水平，认为：图像模糊 & 纹理太少 & 或跟踪失败 => 直接丢弃该帧特征，避免污染回环检测
 		if(descriptors.rows && descriptors.rows < _badSignRatio * float(meanWordsPerLocation))
 		{
 			descriptors = cv::Mat();
@@ -5610,22 +5761,31 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UDEBUG("time descriptor (%d of size=%d) = %fs", descriptors.rows, descriptors.cols, t);
 	}
 
+	// 描述子量化成词袋（visual words）
 	std::list<int> wordIds;
+	// 1 只有有描述子才做量化
 	if(descriptors.rows)
 	{
 		// In case the number of features we want to do quantization is lower
 		// than extracted ones (that would be used for transform estimation)
+		// 2 为“量化”准备特征子集（重点）
 		std::vector<bool> inliers;
 		cv::Mat descriptorsForQuantization = descriptors;
 		std::vector<int> quantizedToRawIndices;
+		// 用于位姿估计的特征数 ≠ 用于词袋量化的特征数
+		// 位姿估计：特征越多越稳 & 词袋检索：特征太多 → 慢 + 噪声 => 因此,量化阶段只取 maxFeatures 个
+		// 3 如果特征数超过 maxFeatures → 进行裁剪
 		if(_feature2D->getMaxFeatures()>0 && descriptors.rows > _feature2D->getMaxFeatures())
 		{
 			UASSERT((int)keypoints.size() == descriptors.rows);
 			int inliersCount = 0;
+			// 裁剪策略分 3 种情况：
+			// 情况 1：单相机 + 网格限制（推荐）
 			if((_feature2D->getGridRows() > 1 || _feature2D->getGridCols() > 1) &&
 				(decimatedData.cameraModels().size()==1 || decimatedData.stereoCameraModels().size()==1 ||
 					data.cameraModels().size()==1 || data.stereoCameraModels().size()==1))
 			{
+				// 使用 网格 + SSC & 保证特征在图像中 均匀分布 & 避免集中在高纹理区域
 				Feature2D::limitKeypoints(keypoints, inliers, _feature2D->getMaxFeatures(),
 					decimatedData.cameraModels().size()?decimatedData.cameraModels()[0].imageSize():
 					decimatedData.stereoCameraModels().size()?decimatedData.stereoCameraModels()[0].left().imageSize():
@@ -5639,26 +5799,32 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					UWARN("Ignored %s and %s parameters as they cannot be used for multi-cameras setup or uncalibrated camera.",
 							Parameters::kKpGridCols().c_str(), Parameters::kKpGridRows().c_str());
 				}
+				// 情况 2：单相机 & 无网格限制
 				if(decimatedData.cameraModels().size()==1 || decimatedData.stereoCameraModels().size()==1 ||
 					data.cameraModels().size()==1 || data.stereoCameraModels().size()==1)
 				{
+					// 普通 SSC 裁剪
 					Feature2D::limitKeypoints(keypoints, inliers, _feature2D->getMaxFeatures(),
 						decimatedData.cameraModels().size()?decimatedData.cameraModels()[0].imageSize():
 						decimatedData.stereoCameraModels().size()?decimatedData.stereoCameraModels()[0].left().imageSize():
 						data.cameraModels().size()?data.cameraModels()[0].imageSize():data.stereoCameraModels()[0].left().imageSize(),
 						_feature2D->getSSC());
 				}
+				// 情况 3：无相机模型 || 多相机模型
 				else
 				{
+					// 退化为：普通数量裁剪
 					Feature2D::limitKeypoints(keypoints, inliers, _feature2D->getMaxFeatures());
 				}
 			}
+			// 4 根据 inliers 复制描述子子集
 			for(size_t i=0; i<inliers.size(); ++i)
 			{
 				if(inliers[i])
 					++inliersCount;
 			}
 
+			// 新建量化用描述子矩阵
 			descriptorsForQuantization = cv::Mat(inliersCount, descriptors.cols, descriptors.type());
 			quantizedToRawIndices.resize(inliersCount);
 			unsigned int oi=0;
@@ -5668,6 +5834,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				if(inliers[k])
 				{
 					UASSERT(oi < quantizedToRawIndices.size());
+					// memcpy 高效复制数据
 					if(descriptors.type() == CV_32FC1)
 					{
 						memcpy(descriptorsForQuantization.ptr<float>(oi), descriptors.ptr<float>(k), descriptors.cols*sizeof(float));
@@ -5676,6 +5843,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 					{
 						memcpy(descriptorsForQuantization.ptr<char>(oi), descriptors.ptr<char>(k), descriptors.cols*sizeof(char));
 					}
+					// 记录 量化特征 → 原始特征索引
 					quantizedToRawIndices[oi] = k;
 					++oi;
 				}
@@ -5686,9 +5854,15 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		}
 
 		// Quantization to vocabulary
+		// 5 描述子 → 词袋量化（Vocabulary）
+		// 调用 视觉词典（Vocabulary）每个描述子：匹配已有词 或创建新词
+		// 返回：wordIds：每个量化特征对应的 word id
 		wordIds = _vwd->addNewWords(descriptorsForQuantization, id);
 
 		// Set ID -1 to features not used for quantization
+		// 6 没参与量化的特征怎么处理？
+		// 所有 keypoints 都必须有一个 wordId，对未量化的特征：赋 负数 ID
+		// >0	有效视觉词 ；<0	仅用于几何，不用于回环
 		if(wordIds.size() < keypoints.size())
 		{
 			std::vector<int> allWordIds;
@@ -5719,6 +5893,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UDEBUG("id %d is a bad signature", id);
 	}
 
+	// 构建用于回环/建图的“词-特征”数据结构
+	// 一个词对应多个特征（multimap）
 	std::multimap<int, int> words;
 	std::vector<cv::KeyPoint> wordsKpts;
 	std::vector<cv::Point3f> words3D;
@@ -5729,6 +5905,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UASSERT(wordIds.size() == keypoints.size());
 		UASSERT(keypoints3D.size() == 0 || keypoints3D.size() == wordIds.size());
 		unsigned int i=0;
+		// 1 坐标尺度重映射（Decimation）
+		// 为什么？特征在 下采样图像 上提取 但 最终地图使用 原始尺度， 保证尺度一致
 		float decimationRatio = float(preDecimation) / float(_imagePostDecimation);
 		double log2value = log(double(preDecimation))/log(2.0);
 		for(std::list<int>::iterator iter=wordIds.begin(); iter!=wordIds.end() && i < keypoints.size(); ++iter, ++i)
@@ -5742,12 +5920,13 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				kpt.size *= decimationRatio;
 				kpt.octave += log2value;
 			}
-			words.insert(std::make_pair(*iter, words.size()));
-			wordsKpts.push_back(kpt);
+			// 2 填充词相关数据
+			words.insert(std::make_pair(*iter, words.size())); // 用于回环检测
+			wordsKpts.push_back(kpt); // 用于可视化 / 匹配
 
 			if(keypoints3D.size())
 			{
-				words3D.push_back(keypoints3D.at(i));
+				words3D.push_back(keypoints3D.at(i)); // 用于建图 / PnP
 				if(util3d::isFinite(keypoints3D.at(i)))
 				{
 					++words3DValid;
@@ -5755,22 +5934,27 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			}
 			if(_rawDescriptorsKept)
 			{
-				wordsDescriptors.push_back(descriptors.row(i));
+				wordsDescriptors.push_back(descriptors.row(i)); // 仅在 _rawDescriptorsKept
 			}
 		}
 	}
 
+	// 检测并生成 ArUco/AprilTag 等视觉地标（Landmarks）
 	Landmarks landmarks = data.landmarks();
 	if(!landmarks.empty() && isIntermediateNode)
 	{
+		// 中间节点：不参与优化 & 不添加约束
 		UDEBUG("Landmarks provided (size=%ld) are ignored because this signature is set as intermediate.", landmarks.size());
 		landmarks.clear();
 	}
+	// 自动检测视觉标记（Marker）
 	else if(_detectMarkers && !isIntermediateNode && !data.imageRaw().empty())
 	{
 		UDEBUG("Detecting markers...");
 		if(landmarks.empty())
 		{
+			// 相机模型准备
+			// 单目：cameraModels 双目：取 left camera
 			std::vector<CameraModel> models = data.cameraModels();
 			if(models.empty())
 			{
@@ -5782,8 +5966,10 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 
 			if(!models.empty() && models[0].isValidForProjection())
 			{
+				// Marker 检测
 				std::map<int, MarkerInfo> markers = _markerDetector->detect(data.imageRaw(), models, data.depthRaw(), _landmarksSize);
 
+				// 构建 Landmark 及协方差
 				for(std::map<int, MarkerInfo>::iterator iter=markers.begin(); iter!=markers.end(); ++iter)
 				{
 					if(iter->first <= 0)
@@ -5792,9 +5978,12 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 						continue;
 					}
 					cv::Mat covariance = cv::Mat::eye(6,6,CV_64FC1);
+					// 情况1：忽略方向（常见）
 					if(_markerOrientationIgnored)
 					{
+						// 不信任旋转
 						covariance(cv::Range(3,6), cv::Range(3,6)) *= 9999; // disable orientation estimation
+						// 只约束位置
 						bool isGTSAM = uStr2Int(uValue(parameters_, Parameters::kOptimizerStrategy(), uNumber2Str(Parameters::defaultOptimizerStrategy()))) == Optimizer::kTypeGTSAM;
 						if(!isGTSAM)
 						{
@@ -5813,6 +6002,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 							covariance(cv::Range(2,3), cv::Range(2,3)) *= _markerLinVariance;
 						}
 					}
+					// 情况2：完整 6DoF
 					else
 					{
 						covariance(cv::Range(0,3), cv::Range(0,3)) *= _markerLinVariance;
@@ -5844,8 +6034,11 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	std::vector<StereoCameraModel> stereoCameraModels = data.stereoCameraModels();
 
 	// apply decimation?
+	// 后端图像降采样（Post Decimation）
+	// 目的：减少内存 & 降低回环 / 建图计算负担 & 特征已经提完 → 可以安全降采样
 	if(_imagePostDecimation > 1 && !isIntermediateNode)
 	{
+		// 已经有 decimatedData（直接复用）
 		if(_imagePostDecimation == preDecimation && decimatedData.isValid())
 		{
 			image = decimatedData.imageRaw();
@@ -5854,6 +6047,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			cameraModels = decimatedData.cameraModels();
 			stereoCameraModels = decimatedData.stereoCameraModels();
 		}
+		// 需要重新降采样
 		else
 		{
 			int decimationDepth = _imagePreDecimation;
@@ -5862,6 +6056,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 				data.cameraModels()[0].imageWidth()>0)
 			{
 				// decimate from RGB image size
+				// 注意深度与 RGB 可能用不同降采样率
 				int targetSize = data.cameraModels()[0].imageHeight() / _imagePreDecimation;
 				if(targetSize >= data.depthRaw().rows)
 				{
@@ -5876,6 +6071,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 
 			depthOrRightImage = util2d::decimate(depthOrRightImage, decimationDepth);
 			image = util2d::decimate(image, _imagePostDecimation);
+			// 同步缩放相机模型
 			for(unsigned int i=0; i<cameraModels.size(); ++i)
 			{
 				cameraModels[i] = cameraModels[i].scaled(1.0/double(_imagePostDecimation));
@@ -5898,27 +6094,36 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UDEBUG("time post-decimation = %fs", t);
 	}
 
+	// 无深度时：用“运动视差”生成 3D 点（非常重要）
 	if(_stereoFromMotion &&
-		!pose.isNull() &&
-		cameraModels.size() == 1 &&
-		words.size() &&
-		(words3D.size() == 0 || (words.size() == words3D.size() && words3DValid!=(int)words3D.size())) &&
+		!pose.isNull() &&  // 有里程计 pose, 知道两帧相对位姿
+		cameraModels.size() == 1 &&  // 只支持单目（立体已有深度）
+		words.size() &&  // 没特征没法搞
+		(words3D.size() == 0 || (words.size() == words3D.size() && words3DValid!=(int)words3D.size())) &&  // 当前帧 3D 点不足, 深度缺失
 		_registrationPipeline->isImageRequired() &&
 		_signatures.size() &&
-		_signatures.rbegin()->second->mapId() == _idMapCount) // same map
+		_signatures.rbegin()->second->mapId() == _idMapCount) // 同一地图,禁止跨子图三角化
 	{
+		// 核心思想: 用前一帧 + 当前帧 + 相机运动 = 三角化 3D 点
 		UDEBUG("Generate 3D words using odometry (%s=true and words3DValid=%d/%d)",
 				Parameters::kMemStereoFromMotion().c_str(), words3DValid, (int)words3D.size());
+		// 取前一帧 signature
 		Signature * previousS = _signatures.rbegin()->second;
 		if(previousS->getWords().size() > 8 && words.size() > 8 && !previousS->getPose().isNull())
 		{
 			UDEBUG("Previous pose(%d) = %s", previousS->id(), previousS->getPose().prettyPrint().c_str());
 			UDEBUG("Current pose(%d) = %s", id, pose.prettyPrint().c_str());
+			// 相机相对运动（这是整个模块的“真值”）
 			Transform cameraTransform = pose.inverse() * previousS->getPose();
 
+			// 参考帧 ID=2（随便给的）
+			// 只放：unique words, keypoints, descriptors
 			Signature cpPrevious(2);
 			// IDs should be unique so that registration doesn't override them
-			std::map<int, int> uniqueWordsOld = uMultimapToMapUnique(previousS->getWords());
+			// 构造“简化版 Signature”（只保留唯一词）
+			// RTAB-Map 的 words 是 wordId → index（可能重复）
+			// 但三角化需要的是：wordId ↔ 唯一 keypoint
+			std::map<int, int> uniqueWordsOld = uMultimapToMapUnique(previousS->getWords());  // 对同一个 wordId，只保留一个 keypoint
 			std::vector<cv::KeyPoint> uniqueWordsKpts;
 			cv::Mat uniqueWordsDescriptors;
 			std::multimap<int, int> uniqueWords;
@@ -5930,6 +6135,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			}
 			cpPrevious.sensorData().setCameraModels(previousS->sensorData().cameraModels());
 			cpPrevious.setWords(uniqueWords, uniqueWordsKpts, std::vector<cv::Point3f>(), uniqueWordsDescriptors);
+			// 当前帧 同样：去重 words, 只保留视觉信息, 强制视觉匹配
 			Signature cpCurrent(1);
 			uniqueWordsOld = uMultimapToMapUnique(words);
 			uniqueWordsKpts.clear();
@@ -5943,9 +6149,12 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			}
 			cpCurrent.sensorData().setCameraModels(cameraModels);
 			// This will force comparing descriptors between both images directly
+			// 用 RTAB-Map 现成的 registration 模块，重新算“干净”的匹配对
 			cpCurrent.setWords(uniqueWords, uniqueWordsKpts, std::vector<cv::Point3f>(), uniqueWordsDescriptors);
 
 			// The following is used only to re-estimate the correspondences, the returned transform is ignored
+			// 用视觉注册重新匹配特征
+			// 这个 tmpt 计算出来，但根本不用
 			Transform tmpt;
 			RegistrationVis reg(parameters_);
 			if(_registrationPipeline->isScanRequired())
@@ -5956,6 +6165,9 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			}
 			else
 			{
+				// RegistrationVis 内部会：descriptor matching & RANSAC 剔除外点
+				// 副产品是：匹配关系已经被“优化”
+				// RTAB-Map 用的是：算位姿只是借口，真正要的是干净的 correspondences
 				tmpt = _registrationPipeline->computeTransformationMod(cpCurrent, cpPrevious, cameraTransform);
 			}
 			UDEBUG("t=%s", tmpt.prettyPrint().c_str());
@@ -5973,6 +6185,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			{
 				previousWords.insert(std::make_pair(iter->first, cpPrevious.getWordsKpts()[iter->second]));
 			}
+			// 利用极几何三角化：返回wordId → Point3f（相机坐标系）
 			std::map<int, cv::Point3f> inliers = util3d::generateWords3DMono(
 					currentWords,
 					previousWords,
@@ -5986,9 +6199,11 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 			UASSERT(words3D.size() == 0 || words.size() == words3D.size());
 			bool words3DWasEmpty = words3D.empty();
 			int added3DPointsWithoutDepth = 0;
+			// 回填 words3D
 			for(std::multimap<int, int>::const_iterator iter=words.begin(); iter!=words.end(); ++iter)
 			{
 				std::map<int, cv::Point3f>::iterator jter=inliers.find(iter->first);
+				// 情况 1：之前没有任何 3D
 				if(words3DWasEmpty)
 				{
 					if(jter != inliers.end())
@@ -6001,8 +6216,10 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 						words3D.push_back(cv::Point3f(bad_point,bad_point,bad_point));
 					}
 				}
+				// 情况 2：之前有 depth，但有缺失
 				else if(!util3d::isFinite(words3D[iter->second]) && jter != inliers.end())
 				{
+					// 只补 NaN，不覆盖真实深度
 					words3D[iter->second] = jter->second;
 					++added3DPointsWithoutDepth;
 				}
@@ -6019,6 +6236,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 
 	LaserScan laserScan = data.laserScanRaw();
 	// Filter the laser scan?
+	// 激光数据过滤（LaserScan）
 	if(!isIntermediateNode && laserScan.size())
 	{
 		if(laserScan.rangeMax() == 0.0f)
@@ -6061,7 +6279,9 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 		UDEBUG("time normals scan = %fs", t);
 	}
 
+	// 构建 Signature（节点本体）
 	Signature * s;
+	// 是否保存原始数据（Bin Data）
 	if(this->isBinDataKept() && (!isIntermediateNode || _saveIntermediateNodeData))
 	{
 		UDEBUG("Bin data kept: rgb=%d, depth=%d, conf=%d, scan=%d, userData=%d",
@@ -6302,11 +6522,14 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 						compressedUserData));
 	}
 
+	// 填充词袋数据
+	// 如果 _reextractLoopClosureFeatures=true：不保存 3D 和 descriptors, 回环时重新提特征
 	s->setWords(words, wordsKpts,
 			_reextractLoopClosureFeatures?std::vector<cv::Point3f>():words3D,
 			_reextractLoopClosureFeatures?cv::Mat():wordsDescriptors);
 
 	// set raw data
+	// 设置原始传感器数据（非压缩）
 	if(!cameraModels.empty())
 	{
 		s->sensorData().setRGBDImage(image, depthOrRightImage, depthConfidence, cameraModels, false);
@@ -6329,6 +6552,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	if(!isIntermediateNode)
 	{
 		std::vector<GlobalDescriptor> globalDescriptors = data.globalDescriptors();
+		// 全局描述子（Global Descriptor）
 		if(_globalDescriptorExtractor)
 		{
 			GlobalDescriptor gdescriptor = _globalDescriptorExtractor->extract(inputData);
@@ -6353,6 +6577,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	}
 
 	// Occupancy grid map stuff
+	// 生成占据栅格地图（可选）
 	if(_createOccupancyGrid && !isIntermediateNode)
 	{
 		if( (_localMapMaker->isGridFromDepth() && !data.depthOrRightRaw().empty()) ||
@@ -6381,6 +6606,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	}
 
 	// prior
+	// 添加“先验约束”（Graph Constraints）
+	// 全局位姿先验 Link::kPosePrior. 来自 GPS / 外部定位, 协方差可控
 	if(!data.globalPose().isNull() && data.globalPoseCovariance().cols==6 && data.globalPoseCovariance().rows==6 && data.globalPoseCovariance().cols==CV_64FC1)
 	{
 		s->addLink(Link(s->id(), s->id(), Link::kPosePrior, data.globalPose(), data.globalPoseCovariance().inv()));
@@ -6393,6 +6620,8 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	}
 	else if(data.gps().stamp() > 0.0)
 	{
+		// GPS 约束（ENU）
+		// 自动建立 GPS 原点 & 经纬度 → ENU & 只约束 x,y,z（通常）
 		if(uIsFinite(data.gps().altitude()) &&
 		   uIsFinite(data.gps().latitude()) &&
 		   uIsFinite(data.gps().longitude()) &&
@@ -6422,6 +6651,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	}
 
 	// IMU / Gravity constraint
+	// IMU / 重力约束
 	if(_useOdometryGravity && !pose.isNull())
 	{
 		s->addLink(Link(s->id(), s->id(), Link::kGravity, pose.rotation()));
@@ -6436,6 +6666,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	{
 		Transform orientation(0,0,0, data.imu().orientation()[0], data.imu().orientation()[1], data.imu().orientation()[2], data.imu().orientation()[3]);
 		// orientation includes roll and pitch but not yaw in local transform
+		// 约束 roll / pitch，防漂
 		orientation= Transform(0,0,data.imu().localTransform().theta()) * orientation * data.imu().localTransform().rotation().inverse();
 
 		s->addLink(Link(s->id(), s->id(), Link::kGravity, orientation));
@@ -6443,6 +6674,7 @@ Signature * Memory::createSignature(const SensorData & inputData, const Transfor
 	}
 
 	//landmarks
+	// Landmark（视觉地标）
 	for(Landmarks::const_iterator iter = landmarks.begin(); iter!=landmarks.end(); ++iter)
 	{
 		if(iter->second.id() > 0)

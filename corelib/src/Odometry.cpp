@@ -300,6 +300,11 @@ Transform Odometry::process(SensorData & data, OdometryInfo * info)
 	return process(data, Transform(), info);
 }
 
+/**
+ * 计算里程计的结果，输出pose
+ * data 为传感器数据，包括imageRaw, depthOrRight，imu等数据
+ * guessIn 为外部里程计的值，如果没有外部里程计则为null
+ */
 Transform Odometry::process(SensorData & data, const Transform & guessIn, OdometryInfo * info)
 {
 	UASSERT_MSG(data.id() >= 0, uFormat("Input data should have ID greater or equal than 0 (id=%d)!", data.id()).c_str());
@@ -674,17 +679,21 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 	}
 
 	Transform imuCurrentTransform;
+	// 如果外部里程计存在，使用外部里程计更新猜测guess。最高优先级
 	if(!guessIn.isNull())
 	{
 		guess = guessIn;
 	}
+	// 如果imu存在，使用imu的姿态更新猜测guess。次优先级
 	else if(!imus_.empty())
 	{
 		// replace orientation guess with IMU (if available)
+		// 仅更新姿态，不更新位置
 		imuCurrentTransform = Transform::getTransform(imus_, data.stamp());
 		if(!imuCurrentTransform.isNull() && !imuLastTransform_.isNull())
 		{
 			Transform orientation = imuLastTransform_.inverse() * imuCurrentTransform;
+			// guess结构如下[R t]
 			guess = Transform(
 					orientation.r11(), orientation.r12(), orientation.r13(), guess.x(),
 					orientation.r21(), orientation.r22(), orientation.r23(), guess.y(),
@@ -702,19 +711,24 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 
 	UTimer time;
 
-	// Deskewing lidar
+	// Deskewing lidar 激光去运动畸变
+	// 这段代码是 RTAB-Map 在前端对激光雷达点云做 deskew（去运动畸变） 的核心实现之一。
+	// 它解决的是：一帧激光扫描在采集过程中机器人在运动，导致点云“被拉弯/扭曲” 的问题。
+	// 怎么做：根据上一帧到当前帧的位姿变化（guess），估计扫描期间的线速度 + 角速度；如果有 IMU，用 IMU 修正角速度；然后按每个激光点的时间戳，把点“拉回”到同一时刻。
 	if( _deskewing &&
 		!data.laserScanRaw().empty() &&
-		data.laserScanRaw().hasTime() &&
+		data.laserScanRaw().hasTime() && // 每个点都要带时间戳。如果你用的是普通 2D 雷达没有 per-point time，这里会直接跳过。
 		dt > 0 &&
 		!guess.isNull())
 	{
 		UDEBUG("Deskewing begin");
 		// Recompute velocity
+		// A 用位姿变化估计速度（第一版）guess：上一帧 → 当前帧 的位姿增量
 		float vx,vy,vz, vroll,vpitch,vyaw;
 		guess.getTranslationAndEulerAngles(vx,vy,vz, vroll,vpitch,vyaw);
 
 		// transform to velocity
+		// 把位姿增量 ÷ 时间差 dt 得到一个平均速度模型
 		vx /= dt;
 		vy /= dt;
 		vz /= dt;
@@ -722,23 +736,28 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		vpitch /= dt;
 		vyaw /= dt;
 
+		// B 如果有 IMU，用 IMU 修正角速度（重点）
 		if(!imus_.empty())
 		{
+			// 计算扫描持续时间
 			float scanTime =
 				data.laserScanRaw().data().ptr<float>(0, data.laserScanRaw().size()-1)[data.laserScanRaw().getTimeOffset()] -
 				data.laserScanRaw().data().ptr<float>(0, 0)[data.laserScanRaw().getTimeOffset()];
 
 			// replace orientation velocity based on IMU (if available)
+			// 取扫描开始 & 结束时刻的 IMU 姿态
 			Transform imuFirstScan = Transform::getTransform(imus_,
 					data.stamp() +
 					data.laserScanRaw().data().ptr<float>(0, 0)[data.laserScanRaw().getTimeOffset()]);
 			Transform imuLastScan = Transform::getTransform(imus_,
 					data.stamp() +
 					data.laserScanRaw().data().ptr<float>(0, data.laserScanRaw().size()-1)[data.laserScanRaw().getTimeOffset()]);
+			// 计算真实旋转量
 			if(!imuFirstScan.isNull() && !imuLastScan.isNull())
 			{
 				Transform orientation = imuFirstScan.inverse() * imuLastScan;
 				orientation.getEulerAngles(vroll, vpitch, vyaw);
+				// 强制 3DoF 的特殊处理
 				if(_force3DoF)
 				{
 					vroll=0;
@@ -754,8 +773,10 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			}
 		}
 
+		// C 构造速度模型并真正 deskew
 		Transform velocity(vx,vy,vz,vroll,vpitch,vyaw);
 		LaserScan scanDeskewed = util3d::deskew(data.laserScanRaw(), data.stamp(), velocity);
+		// 如果成功，替换激光数据
 		if(!scanDeskewed.isEmpty())
 		{
 			data.setLaserScan(scanDeskewed);
@@ -763,17 +784,26 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		info->timeDeskewing = time.ticks();
 		UDEBUG("Deskewing end");
 	}
+	// 有些雷达是 organized scan（二维数组）中间可能有空洞
+	// densify() 会：填补缺失点; 保证扫描是“致密”的
 	if(data.laserScanRaw().isOrganized())
 	{
 		// Laser scans should be dense passing this point
 		data.setLaserScan(data.laserScanRaw().densify());
 	}
 
-
+	// 这段代码是 RTAB-Map 里程计（Odometry）前端的“核心骨架”
+	// 它涵盖了 图像降采样 → 位姿估计 → 速度估计 → 速度滤波（Kalman / 粒子）→ 运动学约束 → 速度平滑 → 位姿更新 → 丢失与重置 的完整闭环。
 	Transform t;
+	// 1 图像降采样（image decimation）
+	// 为什么要降采样？视觉里程计最耗时的是：特征提取; 特征匹配
+	// 降采样可以：提高实时性; 稳定匹配（减少弱纹理噪声）
+	// 降采样，即是采样点数减少。对于一幅N*M的图像来说，如果降采样系数为k,则即是在原图中每行每列每隔k个点取一个点组成一幅图像。
 	if(_imageDecimation > 1 && !data.imageRaw().empty())
 	{
 		// Decimation of images with calibrations
+		// 计算深度图的降采样系数
+		// RGB 和 depth 不一定等比例降采样（非常细节）,需要保证 RGB 和 depth 在物理尺度上对齐
 		SensorData decimatedData = data;
 		int decimationDepth = _imageDecimation;
 		if(	!data.cameraModels().empty() &&
@@ -781,7 +811,9 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			data.cameraModels()[0].imageWidth()>0)
 		{
 			// decimate from RGB image size
+			// 计算降采样后的图像高度
 			int targetSize = data.cameraModels()[0].imageHeight() / _imageDecimation;
+			// 根据图像的降采样计算深度图的降采样系数，取整
 			if(targetSize >= data.depthRaw().rows)
 			{
 				decimationDepth = 1;
@@ -793,13 +825,17 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		}
 		UDEBUG("decimation rgbOrLeft(rows=%d)=%d, depthOrRight(rows=%d)=%d", data.imageRaw().rows, _imageDecimation, data.depthOrRightRaw().rows, decimationDepth);
 
+		// 根据对应的降采样系数对深度和彩色图降采样
 		cv::Mat rgbLeft = util2d::decimate(decimatedData.imageRaw(), _imageDecimation);
 		cv::Mat depthRight = util2d::decimate(decimatedData.depthOrRightRaw(), decimationDepth);
+		// 配合降采样进行相机内参同步缩放（非常重要）
+		// 如果你只缩图、不缩内参：深度会对，3D 点会错，ICP / PnP 会慢慢发散
 		std::vector<CameraModel> cameraModels = decimatedData.cameraModels();
 		for(unsigned int i=0; i<cameraModels.size(); ++i)
 		{
 			cameraModels[i] = cameraModels[i].scaled(1.0/double(_imageDecimation));
 		}
+		// 保存降采样后的各项数据
 		if(!cameraModels.empty())
 		{
 			decimatedData.setRGBDImage(rgbLeft, depthRight, cameraModels);
@@ -819,9 +855,11 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 
 
 		// compute transform
+		// 2 在降采样图像上估计位姿，后续会继续优化
 		t = this->computeTransform(decimatedData, guess, info);
 
 		// transform back the keypoints in the original image
+		// 把关键点“映射回原图坐标”，因为后端 / 回环 / 可视化用的是原图坐标系
 		std::vector<cv::KeyPoint> kpts = decimatedData.keypoints();
 		double log2value = log(double(_imageDecimation))/log(2.0);
 		for(unsigned int i=0; i<kpts.size(); ++i)
@@ -858,18 +896,21 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 	}
 	else if(!data.imageRaw().empty() || !data.laserScanRaw().isEmpty() || (this->canProcessAsyncIMU() && !data.imu().empty()))
 	{
+		// 2 如果不需要降采样，则直接估计位姿，初始值，后续还会优化
 		t = this->computeTransform(data, guess, info);
 	}
 
+	// IMU-only 直接返回 null，RTAB-Map 不会用 IMU 积分单独推里程
 	if(data.imageRaw().empty() && data.laserScanRaw().isEmpty() && !data.imu().empty())
 	{
 		return Transform(); // Return null on IMU-only updates
 	}
 
+	// OdometryInfo 填充（调试用）
 	if(info)
 	{
 		info->timeEstimation = time.ticks();
-		info->lost = t.isNull();
+		info->lost = t.isNull();  // 是否丢失，如果位姿为空，认为丢失
 		info->stamp = data.stamp();
 		info->interval = dt;
 		info->transform = t;
@@ -889,10 +930,12 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		}
 	}
 
+	// 根据估计位姿t获取速度，并开始进行速度估计和滤波
 	if(!t.isNull())
 	{
 		_resetCurrentCount = _resetCountdown;
 
+		// 3 根据估计位姿获取速度
 		float vx,vy,vz, vroll,vpitch,vyaw;
 		t.getTranslationAndEulerAngles(vx,vy,vz, vroll,vpitch,vyaw);
 
@@ -907,10 +950,14 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 			vyaw /= dt;
 		}
 
+		// 4 速度滤波
+		// _holonomic 是否为全向底盘
 		if(_force3DoF || !_holonomic || particleFilters_.size() || _filteringStrategy==1)
 		{
 			if(_filteringStrategy == 1)
 			{
+				// 卡尔曼滤波方式 
+				// 适合：连续、平滑运动 不适合：急停 / 急转（容易滞后）
 				if(velocityGuess_.isNull())
 				{
 					// reset Kalman
@@ -934,6 +981,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 				if(particleFilters_.size())
 				{
 					// Particle filtering
+					// 粒子滤波（particleFilters_）
 					UASSERT(particleFilters_.size()==6);
 					if(velocityGuess_.isNull())
 					{
@@ -953,6 +1001,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 						if(!_holonomic)
 						{
 							// arc trajectory around ICR
+							// 非全向底盘的核心逻辑
 							float tmpY = vyaw!=0.0f ? vx / tan((CV_PI-vyaw)/2.0f) : 0.0f;
 							if(fabs(tmpY) < fabs(vy) || (tmpY<=0 && vy >=0) || (tmpY>=0 && vy<=0))
 							{
@@ -980,6 +1029,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 				else if(!_holonomic)
 				{
 					// arc trajectory around ICR
+					// 非全向底盘的核心逻辑
 					vy = vyaw!=0.0f ? vx / tan((CV_PI-vyaw)/2.0f) : 0.0f;
 				}
 
@@ -991,6 +1041,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 				}
 			}
 
+			// 5 用“滤波后的速度”重新生成位姿
 			if(dt)
 			{
 				t = Transform(vx*dt, vy*dt, vz*dt, vroll*dt, vpitch*dt, vyaw*dt);
@@ -1017,12 +1068,14 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 		{
 			if(dt >= (guessSmoothingDelay_/2.0) || particleFilters_.size() || _filteringStrategy==1)
 			{
+				// 将当前帧的速度结果作为下一帧的速度估计
 				velocityGuess_ = Transform(vx, vy, vz, vroll, vpitch, vyaw);
 				previousVelocities_.clear();
 			}
 			else
 			{
 				// smooth velocity estimation over the past X seconds
+				// 6 速度 guess 的平滑，使用过去guessSmoothingDelay_时间范围内的数据做平滑
 				std::vector<float> v(6);
 				v[0] = vx;
 				v[1] = vy;
@@ -1035,6 +1088,7 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 				{
 					previousVelocities_.pop_front();
 				}
+				// 取过去速度的平均值作为下一帧的速度估计
 				velocityGuess_ = getMeanVelocity(previousVelocities_);
 			}
 		}
@@ -1054,8 +1108,10 @@ Transform Odometry::process(SensorData & data, const Transform & guessIn, Odomet
 
 		imuLastTransform_ = imuCurrentTransform;
 
+		// 7 位姿累计 & 状态更新
 		return _pose *= t; // update
 	}
+	// 8 Odometry 丢失与自动重置（安全机制）
 	else if(_resetCurrentCount > 0)
 	{
 		UWARN("Odometry lost! Odometry will be reset after next %d consecutive unsuccessful odometry updates...", _resetCurrentCount);
