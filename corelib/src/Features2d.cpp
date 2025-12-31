@@ -764,20 +764,32 @@ Feature2D * Feature2D::create(Feature2D::Type type, const ParametersMap & parame
 	return feature2D;
 }
 
+/**
+ * 在给定的灰度图 image 上，在指定 ROI 和 mask 约束下，按网格均匀提取特征点，并进行数量限制与亚像素精细化。
+ */
 std::vector<cv::KeyPoint> Feature2D::generateKeypoints(const cv::Mat & image, const cv::Mat & maskIn)
 {
+	// 保证输入图像非空
+	// 只允许 8位单通道灰度图
+	// UASSERT 是调试宏（断言）
 	UASSERT(!image.empty());
 	UASSERT(image.type() == CV_8UC1);
 
+	// mask 的生成与处理（重点）
 	cv::Mat mask;
 	if(!maskIn.empty())
 	{
+		// CV_16UC1: 深度图（毫米）
+		// CV_32FC1: 深度图（米）
 		if(maskIn.type()==CV_16UC1 || maskIn.type() == CV_32FC1)
 		{
+			// 深度 mask → 二值 mask（8UC1）
+			// 当输入是 深度图：逐像素遍历
 			mask = cv::Mat::zeros(maskIn.rows, maskIn.cols, CV_8UC1);
 			for(int i=0; i<(int)mask.total(); ++i)
 			{
 				float value = 0.0f;
+				// 16UC1（毫米 → 米）
 				if(maskIn.type()==CV_16UC1)
 				{
 					if(((unsigned short*)maskIn.data)[i] > 0 &&
@@ -787,10 +799,14 @@ std::vector<cv::KeyPoint> Feature2D::generateKeypoints(const cv::Mat & image, co
 					}
 				}
 				else
+				// 32FC1（直接使用）
 				{
 					value = ((float*)maskIn.data)[i];
 				}
 
+				// 深度范围过滤（关键）
+				// 只在 有效深度范围 内提取特征
+				// _minDepth：最小深度, _maxDepth：最大深度（0 表示不限制）,ORB 要求 mask 像素值为 255
 				if(value>_minDepth &&
 				   (_maxDepth == 0.0f || value <= _maxDepth) &&
 				   uIsFinite(value))
@@ -799,6 +815,7 @@ std::vector<cv::KeyPoint> Feature2D::generateKeypoints(const cv::Mat & image, co
 				}
 			}
 		}
+		// CV_8UC1: 普通 OpenCV mask
 		else if(maskIn.type()==CV_8UC1)
 		{
 			// assume a standard mask
@@ -810,31 +827,43 @@ std::vector<cv::KeyPoint> Feature2D::generateKeypoints(const cv::Mat & image, co
 		}
 	}
 
+	// ROI 校验, 保证 mask 与 image 尺寸一致。
 	UASSERT(mask.empty() || (mask.cols == image.cols && mask.rows == image.rows));
 
+	// 网格化特征点提取（核心逻辑）
 	std::vector<cv::KeyPoint> keypoints;
 	UTimer timer;
+	// 计算全局 ROI
+	// _roiRatios：按比例裁剪图像（如去边缘）
 	cv::Rect globalRoi = Feature2D::computeRoi(image, _roiRatios);
+	// 若 ROI 无效 → 使用整张图
 	if(!(globalRoi.width && globalRoi.height))
 	{
 		globalRoi = cv::Rect(0,0,image.cols, image.rows);
 	}
 
 	// Get keypoints
+	// 网格划分, 把 ROI 分成 gridRows_ × gridCols_ 个小块。
 	int rowSize = globalRoi.height / gridRows_;
 	int colSize = globalRoi.width / gridCols_;
+	// 每个 grid 限制最大特征数, 保证特征点空间分布均匀
 	int maxFeatures =	maxFeatures_ / (gridRows_ * gridCols_);
+	// 逐 grid 提取特征点
 	for (int i = 0; i<gridRows_; ++i)
 	{
 		for (int j = 0; j<gridCols_; ++j)
 		{
+			// 每个小块： 计算 grid ROI
 			cv::Rect roi(globalRoi.x + j*colSize, globalRoi.y + i*rowSize, colSize, rowSize);
+			// 调用具体算法, 实际检测器（ORB / FAST / SIFT 等）在这里实现
 			std::vector<cv::KeyPoint> subKeypoints;
 			subKeypoints = this->generateKeypointsImpl(image, roi, mask);
+			// 限制数量（非 PyDetector）,防止某个 grid 特征点过多
 			if (this->getType() != Feature2D::Type::kFeaturePyDetector)
 			{
 				limitKeypoints(subKeypoints, maxFeatures, roi.size(), this->getSSC());
 			}
+			// 坐标修正（从 ROI → 原图）
 			if(roi.x || roi.y)
 			{
 				// Adjust keypoint position to raw image
@@ -844,21 +873,26 @@ std::vector<cv::KeyPoint> Feature2D::generateKeypoints(const cv::Mat & image, co
 					iter->pt.y += roi.y;
 				}
 			}
+			// 合并到总 keypoints
 			keypoints.insert( keypoints.end(), subKeypoints.begin(), subKeypoints.end() );
 		}
 	}
 	UDEBUG("Keypoints extraction time = %f s, keypoints extracted = %d (grid=%dx%d, mask empty=%d)",
 			timer.ticks(), keypoints.size(), gridCols_, gridRows_,  mask.empty()?1:0);
 
+	// 亚像素精细化（cornerSubPix）
 	if(keypoints.size() && _subPixWinSize > 0 && _subPixIterations > 0)
 	{
+		// KeyPoint → Point2f
 		std::vector<cv::Point2f> corners;
 		cv::KeyPoint::convert(keypoints, corners);
+		// 亚像素优化
 		cv::cornerSubPix( image, corners,
 				cv::Size( _subPixWinSize, _subPixWinSize ),
 				cv::Size( -1, -1 ),
 				cv::TermCriteria( CV_TERMCRIT_ITER | CV_TERMCRIT_EPS, _subPixIterations, _subPixEps ) );
 
+		// 更新回 KeyPoint
 		for(unsigned int i=0;i<corners.size(); ++i)
 		{
 			keypoints[i].pt = corners[i];

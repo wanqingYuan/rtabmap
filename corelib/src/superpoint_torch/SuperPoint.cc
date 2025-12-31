@@ -206,39 +206,63 @@ std::vector<cv::KeyPoint> SPDetector::detect(const cv::Mat &img, const cv::Mat &
 	}
 }
 
+/**
+ * SuperPoint 描述子提取
+ * 在已经检测到关键点的前提下，从 SuperPoint 网络输出的特征图中，为每个关键点采样并生成 256 维描述子。
+ * 输出：cv::Mat，大小为 [n_keypoints, 256], 每一行是一个 SuperPoint 描述子（float32）
+ */
 cv::Mat SPDetector::compute(const std::vector<cv::KeyPoint> &keypoints)
 {
+	// 状态与异常检查
+	// 是否已经 detect(),detect() 会运行网络，得到：关键点, desc_（描述子特征图）
+	// SuperPoint 的 detect + compute 是强绑定的：compute() 只做采样，不重新跑网络
 	if(!detected_)
 	{
 		UERROR("SPDetector has been reset before extracting the descriptors! detect() should be called before compute().");
 		return cv::Mat();
 	}
+	// 没有关键点直接返回
 	if(keypoints.empty())
 	{
 		return cv::Mat();
 	}
+	// 检查模型是否存在
 	if(model_.get())
 	{
+		// 关键点坐标准备（非常关键）
+		// 构造关键点矩阵, 注意顺序是 (y, x)，不是 (x, y)
 		cv::Mat kpt_mat(keypoints.size(), 2, CV_32F);  // [n_keypoints, 2]  (y, x)
 
 		// Based on sample_descriptors() of SuperPoint implementation in SuperGlue:
 		// https://github.com/magicleap/SuperGluePretrainedNetwork/blob/45a750e5707696da49472f1cad35b0b203325417/models/superpoint.py#L80-L92
+		// SuperPoint 的坐标修正, SuperPoint 的描述子特征图是：
+		// 原图尺寸: H x W
+		// 特征图尺寸: H/8 x W/8
+		// s = 8 表示下采样倍数。
 		float s = 8;
 		for (size_t i = 0; i < keypoints.size(); i++) {
 			kpt_mat.at<float>(i, 0) = (float)keypoints[i].pt.y - s/2 + 0.5;
 			kpt_mat.at<float>(i, 1) = (float)keypoints[i].pt.x - s/2 + 0.5;
 		}
 
+		// OpenCV → Torch 张量
+		// 从 OpenCV Mat 构造 Torch Tensor
+		// fkpts 形状：[n_keypoints, 2]
 		auto fkpts = torch::from_blob(kpt_mat.data, {(long int)keypoints.size(), 2}, torch::kFloat);
 
+		// 描述子特征图尺寸
 		float w = desc_.size(3); //W/8
 		float h = desc_.size(2); //H/8
 
 		torch::Device device(cuda_?torch::kCUDA:torch::kCPU);
+		// 构造 grid（grid_sample 的输入）
+		// grid 初始化
 		auto grid = torch::zeros({1, 1, fkpts.size(0), 2}).to(device);  // [1, 1, n_keypoints, 2]
+		// 坐标归一化到 [-1, 1]
 		grid[0][0].slice(1, 0, 1) = 2.0 * fkpts.slice(1, 1, 2) / (w*s - s/2 - 0.5) - 1;  // x
 		grid[0][0].slice(1, 1, 2) = 2.0 * fkpts.slice(1, 0, 1) / (h*s - s/2 - 0.5) - 1;  // y
 
+		// 每个关键点得到一个 256 维描述子
 		auto desc = torch::grid_sampler(desc_, grid, 0, 0, true);  // [1, 256, 1, n_keypoints]
 
 		// normalize to 1

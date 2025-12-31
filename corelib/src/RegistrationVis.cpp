@@ -412,6 +412,7 @@ Transform RegistrationVis::computeTransformationImpl(
 				// 如果keypoints为空，通过计算获取keypoints
 				if(!imageFrom.empty())
 				{
+					// 转成灰度图
 					if(imageFrom.channels() > 1)
 					{
 						cv::Mat tmp;
@@ -550,6 +551,7 @@ Transform RegistrationVis::computeTransformationImpl(
 #endif
 			{
 				// convert to grayscale
+				// 转换到灰度图
 				if(imageFrom.channels() > 1)
 				{
 					cv::Mat tmp;
@@ -844,8 +846,10 @@ Transform RegistrationVis::computeTransformationImpl(
 			}
 
 			// extract descriptors
+			// 提取描述子
 			UDEBUG("kptsFrom=%d kptsFromSource=%d", (int)kptsFrom.size(), kptsFromSource);
 			UDEBUG("kptsTo=%d kptsToSource=%d", (int)kptsTo.size(), kptsToSource);
+			// from节点提取描述子
 			cv::Mat descriptorsFrom;
 			if(kptsFromSource == 2 &&
 				fromSignature.getWordsDescriptors().rows &&
@@ -872,6 +876,7 @@ Transform RegistrationVis::computeTransformationImpl(
 				descriptorsFrom = _detectorFrom->generateDescriptors(imageFrom, kptsFrom);
 			}
 
+			// to节点提取描述子
 			cv::Mat descriptorsTo;
 			if(kptsTo.size())
 			{
@@ -899,6 +904,7 @@ Transform RegistrationVis::computeTransformationImpl(
 			}
 
 			// create 3D keypoints
+			// 构造3D关键点
 			std::vector<cv::Point3f> kptsFrom3D;
 			std::vector<cv::Point3f> kptsTo3D;
 			if(kptsFromSource == 2 &&
@@ -975,6 +981,7 @@ Transform RegistrationVis::computeTransformationImpl(
 
 			UASSERT(kptsFrom.empty() || descriptorsFrom.rows == 0 || int(kptsFrom.size()) == descriptorsFrom.rows);
 
+			// 特征设置
 			fromSignature.sensorData().setFeatures(kptsFrom, kptsFrom3D, descriptorsFrom);
 			toSignature.sensorData().setFeatures(kptsTo, kptsTo3D, descriptorsTo);
 
@@ -985,7 +992,9 @@ Transform RegistrationVis::computeTransformationImpl(
 			// We have all data we need here, so match!
 			if(descriptorsFrom.rows > 0 && descriptorsTo.rows > 0)
 			{
+				// 相机模型 & 标定检查
 				std::vector<CameraModel> models;
+				// 双目 / 多目
 				if(!toSignature.sensorData().stereoCameraModels().empty())
 				{
 					for(size_t i=0; i<toSignature.sensorData().stereoCameraModels().size(); ++i)
@@ -993,17 +1002,20 @@ Transform RegistrationVis::computeTransformationImpl(
 						models.push_back(toSignature.sensorData().stereoCameraModels()[i].left());
 					}
 				}
+				// 单目
 				else
 				{
 					models = toSignature.sensorData().cameraModels();
 				}
 
+				// 标定是否可用？
 				bool isCalibrated = !models.empty();
 				for(size_t i=0; i<models.size() && isCalibrated; ++i)
 				{
 					isCalibrated = models[i].isValidForProjection();
 
 					// For old database formats
+					// 兼容老数据库格式（imageWidth / Height = 0 时修复）
 					if(isCalibrated && (models[i].imageWidth()==0 || models[i].imageHeight()==0))
 					{
 						if(!toSignature.sensorData().imageRaw().empty())
@@ -1018,12 +1030,17 @@ Transform RegistrationVis::computeTransformationImpl(
 				}
 
 				// If guess is set, limit the search of matches using optical flow window size
+				// 有 from→to 的位姿初值
 				bool guessSet = !guess.isIdentity() && !guess.isNull();
+				// 是否使用 guess 投影匹配
+				// _guessWinSize：光流窗口大小
 				if(guessSet && _guessWinSize > 0 && kptsFrom3D.size() &&
 						isCalibrated &&  // needed for projection
 						_estimationType != 2) // To make sure we match all features for 2D->2D
 				{
+					// 投影匹配 核心思想：把 from 帧的 3D 点，用 guess 位姿投影到 to 图像中，然后只在投影附近做描述子匹配
 					// Use guess to project 3D "from" keypoints into "to" image
+					// 3D → 2D 投影
 					UDEBUG("");
 					UASSERT((int)kptsTo.size() == descriptorsTo.rows);
 					UASSERT((int)kptsFrom3D.size() == descriptorsFrom.rows);
@@ -1049,6 +1066,7 @@ Transform RegistrationVis::computeTransformationImpl(
 						UDEBUG("Projected points=%d", (int)projected.size());
 
 						//remove projected points outside of the image
+						// 过滤掉：投影在图像外的 & 深度 ≤ 0 的 & 多相机中重复投影的点
 						UASSERT((int)projected.size() == descriptorsFrom.rows);
 						int cornersInFrame = 0;
 						for(unsigned int i=0; i<projected.size(); ++i)
@@ -1076,11 +1094,16 @@ Transform RegistrationVis::computeTransformationImpl(
 					// For each projected feature guess of "from" in "to", find its matching feature in
 					// the radius around the projected guess.
 					// TODO: do cross-check?
+					// 局部搜索（KD-Tree + radius search）
 					UDEBUG("guessMatchToProjection=%d, cornersProjected=%d orignalWordsFromIds=%d (added=%ld, duplicates=%d)",
 							_guessMatchToProjection?1:0, (int)cornersProjected.size(), (int)orignalWordsFromIds.size(),
 							added.size(), duplicates);
 					if(cornersProjected.size())
 					{
+						// 两种投影匹配策略（重要）
+						// _guessMatchToProjection == true
+						// to → projected：对 projected 点建 KD-Tree & 对 to 帧每个点做 radiusSearch & 再做 描述子 NN / NNDR / cross-check
+						// 更适合 to 帧特征更多 的情况
 						if(_guessMatchToProjection)
 						{
 							UDEBUG("match frame to projected");
@@ -1223,6 +1246,9 @@ Transform RegistrationVis::computeTransformationImpl(
 							}
 							UDEBUG("addWordsFromNotMatched=%d -> words3From=%d", addWordsFromNotMatched, (int)words3From.size());
 						}
+						// _guessMatchToProjection == false
+						// projected → to：对 to 帧建 KD-Tree & projected 点做 radiusSearch & 再做描述子匹配
+						// 更适合 from 帧约束更强 的情况
 						else
 						{
 							UDEBUG("match projected to frame");
@@ -1373,6 +1399,7 @@ Transform RegistrationVis::computeTransformationImpl(
 					}
 					UDEBUG("");
 				}
+				// 如果不能用 guess：全局匹配
 				else
 				{
 					if(guessSet && _guessWinSize > 0 && kptsFrom3D.size() && !isCalibrated)
@@ -1384,6 +1411,7 @@ Transform RegistrationVis::computeTransformationImpl(
 
 					UDEBUG("");
 					// match between all descriptors
+					// 支持的匹配方式
 					std::list<int> fromWordIds;
 					std::list<int> toWordIds;
 #ifdef RTABMAP_PYTHON
@@ -1550,6 +1578,7 @@ Transform RegistrationVis::computeTransformationImpl(
 					}
 				}
 			}
+			// 最后兜底：只有 from，没有 to
 			else if(descriptorsFrom.rows)
 			{
 				//just create fake words
