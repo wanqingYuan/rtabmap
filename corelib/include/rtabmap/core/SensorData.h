@@ -373,56 +373,58 @@ public:
 
 private:
 	int _id;
-	double _stamp;
-
-	cv::Mat _imageCompressed;          // compressed image
-	cv::Mat _depthOrRightCompressed;   // compressed image
-	cv::Mat _depthConfidenceCompressed;   // compressed data
+	double _stamp;  // 时间戳，通常是相机采集或激光数据的时间。
+	// 图像与深度数据
+	cv::Mat _imageCompressed;          // compressed image 原始彩色或灰度图像
+	cv::Mat _depthOrRightCompressed;   // compressed image 深度相机的深度图或双目右目图。
+	cv::Mat _depthConfidenceCompressed;   // compressed data 深度可信度图，用于去除噪声点。
 	LaserScan _laserScanCompressed;      // compressed data
 
-	cv::Mat _imageRaw;          // CV_8UC1 or CV_8UC3
-	cv::Mat _depthOrRightRaw;   // depth CV_16UC1 or CV_32FC1, right image CV_8UC1 or CV_8UC3
-	cv::Mat _depthConfidenceRaw;   // CV_8UC1
+	cv::Mat _imageRaw;          // CV_8UC1 or CV_8UC3 原始彩色或灰度图像
+	cv::Mat _depthOrRightRaw;   // depth CV_16UC1 or CV_32FC1, right image CV_8UC1 or CV_8UC3 深度相机的深度图或双目右目图。
+	cv::Mat _depthConfidenceRaw;   // CV_8UC1 深度可信度图，用于去除噪声点。
 	LaserScan _laserScanRaw;
-
+	// 相机模型
 	std::vector<CameraModel> _cameraModels;
 	std::vector<StereoCameraModel> _stereoCameraModels;
 
-	// user data
+	// user data 用户自定义数据
 	cv::Mat _userDataCompressed;      // compressed data
 	cv::Mat _userDataRaw;
 
-	// occupancy grid
+	// occupancy grid 占据栅格
+	// 用于地面网格、障碍物网格和空闲网格的存储（栅格地图）。
 	cv::Mat _groundCellsCompressed;
 	cv::Mat _obstacleCellsCompressed;
 	cv::Mat _emptyCellsCompressed;
 	cv::Mat _groundCellsRaw;
 	cv::Mat _obstacleCellsRaw;
 	cv::Mat _emptyCellsRaw;
-	float _cellSize;
-	cv::Point3f _viewPoint;
+	float _cellSize;  // 网格分辨率。
+	cv::Point3f _viewPoint;  // 传感器观测位置。
 
-	// environmental sensors
+	// environmental sensors 环境传感器
+	// 包含额外环境信息，例如温度、湿度、气压等。
 	EnvSensors _envSensors;
 
-	// landmarks
+	// landmarks 该帧观测到的 3D 特征点/地图点（通常来自 SLAM 或外部传感器）。
 	Landmarks _landmarks;
 
-	// features
+	// features 特征点与描述子
 	std::vector<cv::KeyPoint> _keypoints;
 	std::vector<cv::Point3f> _keypoints3D;
 	cv::Mat _descriptors;
 
-	// global descriptors
+	// global descriptors 全局描述子
 	std::vector<GlobalDescriptor> _globalDescriptors;
 
-	Transform groundTruth_;
-
-	Transform globalPose_;
+	// 位姿信息
+	Transform groundTruth_;  // 真实位姿（如果有真实轨迹，用于评估）。
+	Transform globalPose_;  // SLAM 或里程计估计的全局位姿。
 	cv::Mat globalPoseCovariance_; // 6x6 double
 
+	// GPS 与 IMU
 	GPS gps_;
-
 	IMU imu_;
 
 #ifdef HAVE_OPENCV_CUDEV

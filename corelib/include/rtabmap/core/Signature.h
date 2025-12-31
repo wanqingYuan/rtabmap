@@ -45,9 +45,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 namespace rtabmap
 {
 /**
- * RTAB-Map 中的 Signature（节点）维护的是“邻接表（Adjacency List）”
- * 每个 Signature 的内部数据结构维护 自己的 Links，与其他节点独立。
- * 这意味着 Link 是 存储在两个节点内部的两份数据，不是共享的。
+ * Signature 在 RTAB-Map 中表示 一个关键帧节点（Keyframe），
+ * 包含了这一帧的所有视觉、里程计、词袋、位姿等信息，是 SLAM 中地图图优化和回环检测的核心数据结构之一。
  */
 class RTABMAP_CORE_EXPORT Signature
 {
@@ -146,32 +145,40 @@ public:
 	unsigned long getMemoryUsed(bool withSensorData=true) const; // Return memory usage in Bytes
 
 private:
-	int _id;
-	int _mapId;
-	double _stamp;
-	std::multimap<int, Link> _links; // id, transform
-	std::map<int, Link> _landmarks;
-	int _weight;
-	std::string _label;
-	bool _saved; // If it's saved to bd
+	// 基本信息
+	int _id;  // Signature 的唯一ID
+	int _mapId;  // 所属地图ID（同一张地图内唯一）
+	double _stamp;  // 通常是相机捕捉图像时的 ROS 时间戳或系统时间。
+	/**
+	 * RTAB-Map 中的 Signature（节点）维护的是“邻接表（Adjacency List）”
+	 * 每个 Signature 的内部数据结构维护 自己的 Links，与其他节点独立。
+	 * 这意味着 Link 是 存储在两个节点内部的两份数据，不是共享的。
+	 */
+	std::multimap<int, Link> _links; // 和其他关键帧的 位姿约束 id, transform
+	std::map<int, Link> _landmarks;  // 该帧观测到的 全局特征点/地图点
+	int _weight;  // 这个节点在图优化中可能的权重（重要性）。
+	std::string _label;  // 通常用于语义标签或手动标记（可选）。
+	bool _saved; // 是否已经保存到数据库
 	bool _modified;
 	bool _linksModified; // Optimization when updating signatures in database
 
 	// Contains all words (Some can be duplicates -> if a word appears 2
 	// times in the signature, it will be 2 times in this list)
 	// Words match with the CvSeq keypoints and descriptors
-	std::multimap<int, int> _words; // word <id, keypoint index>
-	std::vector<cv::KeyPoint> _wordsKpts;
-	std::vector<cv::Point3f> _words3; // in base_link frame (localTransform applied))
-	cv::Mat _wordsDescriptors;
-	std::map<int, int> _wordsChanged; // <oldId, newId>
-	bool _enabled;
-	int _invalidWordsCount;
-
+	// 视觉词袋信息
+	std::multimap<int, int> _words; // BoW (Bag-of-Words) 表示，存储视觉单词 ID 和对应的关键点索引。<id, keypoint index>
+	std::vector<cv::KeyPoint> _wordsKpts;  // 对应的 OpenCV KeyPoint 特征。
+	std::vector<cv::Point3f> _words3; // 特征点在 机器人 base_link 坐标系下的三维坐标 
+	cv::Mat _wordsDescriptors;  // 特征描述子
+	std::map<int, int> _wordsChanged; // 在词袋更新时记录旧 ID → 新 ID 的映射。<oldId, newId>
+	bool _enabled;  // 该帧是否启用（可能用于稀疏关键帧选择）
+	int _invalidWordsCount;  // 无效或丢失的特征点数量，用于质量评估。
+	// 位姿与运动
 	Transform _pose;
 	Transform _groundTruthPose;
 	std::vector<float> _velocity;
-
+	// 传感器数据
+	// 存储原始传感器数据，包括彩色图、深度图、IMU、激光等信息，用于重建、回环检测或特征提取。
 	SensorData _sensorData;
 };
 
