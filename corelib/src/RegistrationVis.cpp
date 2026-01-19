@@ -933,6 +933,7 @@ Transform RegistrationVis::computeTransformationImpl(
 						   kptsFrom.size(),
 						   fromSignature.sensorData().keypoints3D().size());
 				}
+				// 生成3D的关键点，这里双目相机会根据左右目的匹配通过Z = baseline * f / (d + cx1-cx0)公式计算出特征点的深度值
 				kptsFrom3D = _detectorFrom->generateKeypoints3D(fromSignature.sensorData(), kptsFrom);
 				UDEBUG("generated kptsFrom3D=%d", (int)kptsFrom3D.size());
 			}

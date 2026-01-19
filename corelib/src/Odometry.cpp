@@ -1229,12 +1229,22 @@ void Odometry::initKalmanFilter(const Transform & initialPose, float vx, float v
 	}
 }
 
+/**
+ * 根据时间间隔 dt，用运动模型预测下一时刻的状态，并从预测状态中取出线速度和角速度。
+ * dt：当前预测步长（秒）
+ * vx, vy, vz：线速度输出指针
+ * vroll, vpitch, vyaw：角速度输出指针
+ */
 void Odometry::predictKalmanFilter(float dt, float * vx, float * vy, float * vz, float * vroll, float * vpitch, float * vyaw)
 {
 	// Set transition matrix with current dt
 	if(_force3DoF)
 	{
 		// 2D:
+		// x(k+1) = x(k) + v(k)·dt + ½a·dt²
+		// v(k+1) = v(k) + a·dt
+		// a(k+1) = a(k)
+		// 根据上述 恒加速度模型，得到以下的转移矩阵
 		//  [1 0 dt  0 dt2    0   0    0     0] x
 		//  [0 1  0 dt   0  dt2   0    0     0] y
 		//  [0 0  1  0   dt   0   0    0     0] x'
@@ -1299,6 +1309,10 @@ void Odometry::predictKalmanFilter(float dt, float * vx, float * vy, float * vz,
 
 	// First predict, to update the internal statePre variable
 	UDEBUG("Predict");
+	// 执行预测步骤，这一步完成了：
+	// 状态预测  x̂(k|k−1) = A · x̂(k−1)
+	// 协方差预测  P(k|k−1) = A·P·Aᵀ + Q
+	// 预测结果存储在 prediction 中。
 	const cv::Mat & prediction = kalmanFilter_.predict();
 
 	if(vx)
@@ -1315,6 +1329,11 @@ void Odometry::predictKalmanFilter(float dt, float * vx, float * vy, float * vz,
 		*vyaw = prediction.at<float>(_force3DoF?7:14);      // yaw'
 }
 
+/**
+ * 用外部测量得到的速度（里程计/视觉/IMU 等）去“纠正”预测结果，并输出更可信的速度估计。
+ * 输入： 当前测得的速度（测量值）
+ * 输出： 更新后的最优速度估计（会覆盖原值）
+ */
 void Odometry::updateKalmanFilter(float & vx, float & vy, float & vz, float & vroll, float & vpitch, float & vyaw)
 {
 	// Set measurement to predict
@@ -1339,6 +1358,11 @@ void Odometry::updateKalmanFilter(float & vx, float & vy, float & vz, float & vr
 
 	// The "correct" phase that is going to use the predicted value and our measurement
 	UDEBUG("Correct");
+	// 这一步内部完成的是标准 Kalman Update：
+	// 计算卡尔曼增益  K = P Hᵀ (H P Hᵀ + R)⁻¹
+	// 更新状态  x̂(k) = x̂(k|k−1) + K (z − H x̂(k|k−1))
+	// 更新协方差  P(k) = (I − K H) P
+	// 直观理解：测量噪声小 → 更相信测量; 模型噪声小 → 更相信预测
 	const cv::Mat & estimated = kalmanFilter_.correct(measurements);
 
 

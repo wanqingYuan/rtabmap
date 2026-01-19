@@ -395,6 +395,7 @@ Transform estimateMotion3DTo2D(
 	for(unsigned int i=0; i<ids.size(); ++i)
 	{
 		std::map<int, cv::Point3f>::const_iterator iter=words3A.find(ids[i]);
+		// 过滤掉无限远的点（超出深度探测范围的点）
 		if(iter != words3A.end() && util3d::isFinite(iter->second))
 		{
 			const cv::Point2f & kpt = words2B.find(ids[i])->second.pt;
