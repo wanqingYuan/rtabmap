@@ -2233,6 +2233,7 @@ void MainWindow::processStats(const rtabmap::Statistics & stat)
 						matchId = landmarkNodeRef;
 					}
 				}
+				// 展示是否拒绝回环检测结果
 				else if(rejectedHyp && highestHypothesisValue >= _preferencesDialog->getLoopThr())
 				{
 					show = _preferencesDialog->imageRejectedShown() || _preferencesDialog->imageHighestHypShown();

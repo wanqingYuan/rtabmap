@@ -53,11 +53,11 @@ namespace rtabmap {
 class RTABMAP_CORE_EXPORT Statistics
 {
 	RTABMAP_STATS(Loop, Id,); // Combined loop or proximity detection
-	RTABMAP_STATS(Loop, RejectedHypothesis,);
+	RTABMAP_STATS(Loop, RejectedHypothesis,);  // 是否拒绝本次回环
 	RTABMAP_STATS(Loop, Accepted_hypothesis_id,);
 	RTABMAP_STATS(Loop, Suppressed_hypothesis_id,);
 	RTABMAP_STATS(Loop, Highest_hypothesis_id,);
-	RTABMAP_STATS(Loop, Highest_hypothesis_value,);
+	RTABMAP_STATS(Loop, Highest_hypothesis_value,);  // 
 	RTABMAP_STATS(Loop, Vp_hypothesis,);
 	RTABMAP_STATS(Loop, Reactivate_id,);
 	RTABMAP_STATS(Loop, Hypothesis_ratio,);

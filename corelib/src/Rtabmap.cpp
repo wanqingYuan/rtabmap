@@ -4516,6 +4516,7 @@ bool Rtabmap::process(
 
 			statistics_.addStatistic(Statistics::kLoopAccepted_hypothesis_id(), _loopClosureHypothesis.first);
 			statistics_.addStatistic(Statistics::kLoopSuppressed_hypothesis_id(), loopIdSuppressedByProximity);
+			// 本次处理中的最高回环候选 <id, score>
 			statistics_.addStatistic(Statistics::kLoopHighest_hypothesis_id(), _highestHypothesis.first);
 			statistics_.addStatistic(Statistics::kLoopHighest_hypothesis_value(), _highestHypothesis.second);
 			statistics_.addStatistic(Statistics::kLoopHypothesis_reactivated(), lcHypothesisReactivated);
@@ -4661,6 +4662,8 @@ bool Rtabmap::process(
 			statistics_.addStatistic(Statistics::kKeypointIndex_memory_usage(), _memory->getVWDictionary()->getIndexMemoryUsed());
 
 			//Epipolar geometry constraint
+			// 是否拒绝本次回环检测结果 加入统计数据 传送到窗口显示
+			// 如果拒绝，窗口会显示 Loop hypothesis %1(highestHypothesisId) rejected!
 			statistics_.addStatistic(Statistics::kLoopRejectedHypothesis(), rejectedLoopClosure?1.0f:0);
 
 			statistics_.addStatistic(Statistics::kMemorySmall_movement(), smallDisplacement?1.0f:0);

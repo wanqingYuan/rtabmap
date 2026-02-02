@@ -194,6 +194,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Rtabmap, RectifyOnlyFeatures,          bool, false,  uFormat("If \"%s\" is false and this parameter is true, the whole RGB image will not be rectified, only the features. Warning: As projection of RGB-D image to point cloud is assuming that images are rectified, the generated point cloud map will have wrong colors if this parameter is true.", kRtabmapImagesAlreadyRectified().c_str()));
 
     // Hypotheses selection
+    // loopthr 与 hypotheses 有关，用于判断是否拒绝回环
     RTABMAP_PARAM(Rtabmap, LoopThr,           float, 0.11,      "Loop closing threshold.");
     RTABMAP_PARAM(Rtabmap, LoopRatio,         float, 0,         "The loop closure hypothesis must be over LoopRatio x lastHypothesisValue.");
     RTABMAP_PARAM(Rtabmap, LoopGPS,           bool,  true,      uFormat("Use GPS to filter likelihood (if GPS is recorded). Only locations inside the local radius \"%s\" of the current GPS location are considered for loop closure detection.", kRGBDLocalRadius().c_str()));
