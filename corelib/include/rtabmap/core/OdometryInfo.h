@@ -45,14 +45,16 @@ public:
 	OdometryInfo copyWithoutData() const;
 	std::map<std::string, float> statistics(const Transform & pose = Transform());
 
-	bool lost;
-	RegistrationInfo reg;
-	int features;
-	int localMapSize;
-	int localScanMapSize;
-	int localKeyFrames;
-	int localBundleOutliers;
-	int localBundleConstraints;
+	bool lost;  // true：里程计跟踪失败
+	RegistrationInfo reg;  // 点云 / 特征匹配信息，用于判断当前估计是否可信
+	// 特征 & 局部地图统计
+	int features;  // 当前帧提取的特征数
+	int localMapSize;  // 局部视觉地图点数
+	int localScanMapSize;  // 局部激光地图大小
+	int localKeyFrames;  // 当前参与优化的关键帧数
+	// 局部 BA（Bundle Adjustment）信息
+	int localBundleOutliers;  // 被剔除的外点
+	int localBundleConstraints;  // 当前局部 BA 的约束数量
 	float localBundleTime;
 	std::map<int, Transform> localBundlePoses;
 	std::map<int, std::vector<CameraModel> > localBundleModels;
@@ -60,14 +62,17 @@ public:
 	int localBundleMaxKeyFramesForInlier;
 	std::vector<int> localBundleOutliersPerCam;
 	bool keyFrameAdded;
+	// 时间消耗统计（性能分析）
 	float timeDeskewing;
 	float timeEstimation;
 	float timeParticleFiltering;
 	double stamp;
-	double interval;
-	Transform transform;
-	Transform transformFiltered;
+	double interval;  // 与上一帧时间差
+	// 位姿相关（核心输出）
+	Transform transform;  // 原始 odom 估计
+	Transform transformFiltered;  // 滤波后的
 	Transform transformGroundTruth;
+	// 预测位姿（先验）
 	Transform guessVelocity; // deprecated, will be removed. Use guess and interval instead.
 	Transform guess;
 	float distanceTravelled;
