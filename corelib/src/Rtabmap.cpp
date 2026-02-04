@@ -582,6 +582,7 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 					_optimizedPoses.erase(iter->first);
 				}
 			}
+			// 保存优化后的位姿图和最新的定位姿态。
 			_memory->saveOptimizedPoses(_optimizedPoses, _lastLocalizationPose);
 		}
 		_memory->close(databaseSaved, true, ouputDatabasePath);
@@ -798,6 +799,7 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 			}
 
 			// In both cases, we save the latest optimized graph and latest localization pose
+			// 保存优化后的位姿图和最新的定位姿态。
 			_memory->saveOptimizedPoses(_optimizedPoses, _lastLocalizationPose);
 
 			// Mode changed from Localization to Mapping, clear local graph
@@ -4759,8 +4761,8 @@ bool Rtabmap::process(
 		if(_startNewMapOnLoopClosure &&
 			_memory->isIncremental() &&              // only in mapping mode
 			graph::filterLinks(signature->getLinks(), Link::kSelfRefLink).size() == 0 &&      // alone in the current map
-			(landmarksDetected.empty() || rejectedLoopClosure) &&      // if we re not seeing a landmark from a previous map
-			_memory->getWorkingMem().size()>=2)       // The working memory should not be empty (beside virtual signature)
+			(landmarksDetected.empty() || rejectedLoopClosure) &&     // 没有检测到地标或回环（意味着无法与旧地图建立联系）
+			_memory->getWorkingMem().size()>=2)      // 内存不为空（避免刚启动时把第一帧删了）
 		{
 			UWARN("Ignoring location %d because a global loop closure is required before starting a new map!",
 					signature->id());
@@ -4768,7 +4770,7 @@ bool Rtabmap::process(
 			_memory->deleteLocation(signature->id());
 		}
 		else if(_startNewMapOnGoodSignature &&
-				(signature->getLandmarks().empty() && signature->isBadSignature()) &&
+				(signature->getLandmarks().empty() && signature->isBadSignature()) &&  // 特征点太少，且没看到地标
 				graph::filterLinks(signature->getLinks(), Link::kSelfRefLink).size() == 0)     // alone in the current map
 		{
 			UWARN("Ignoring location %d because a good signature (with enough features or with a landmark detected) is required before starting a new map!",
@@ -4776,11 +4778,11 @@ bool Rtabmap::process(
 			signaturesRemoved.push_back(signature->id());
 			_memory->deleteLocation(signature->id());
 		}
-		else if((smallDisplacement || tooFastMovement) &&
-				_loopClosureHypothesis.first == 0 &&
-				lastProximitySpaceClosureId == 0 &&
-				(rejectedLoopClosure || landmarksDetected.empty()) &&
-				!addedNewLandmark)
+		else if((smallDisplacement || tooFastMovement) &&   // 1. 没怎么动 或者 动太快(模糊)
+				_loopClosureHypothesis.first == 0 &&    // 2. 没检测到全局回环 (BoW)
+				lastProximitySpaceClosureId == 0 &&     // 3. 没检测到局部回环 (Proximity)
+				(rejectedLoopClosure || landmarksDetected.empty()) && // 4. 回环被拒绝 或者 没看到地标
+				!addedNewLandmark) // 5. 没发现新地标
 		{
 			// Don't delete the location if a loop closure is detected
 			UINFO("Ignoring location %d because the displacement is too small! (d=%f a=%f)",
@@ -4791,6 +4793,11 @@ bool Rtabmap::process(
 		}
 		else
 		{
+			// 将数据持久化到数据库中。
+			// 场景：如果不满足上述任何删除条件。
+			// 移动了足够距离（正常的关键帧）。
+			// 或者，虽然没动，但是检测到了回环（为了闭环必须保存）。
+			// 或者，这是地图的第一帧（且质量尚可）。
 			_memory->saveLocationData(signature->id());
 		}
 	}

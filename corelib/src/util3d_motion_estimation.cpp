@@ -129,6 +129,9 @@ Transform estimateMotion3DTo2D(
 		cv::Mat tvec = (cv::Mat_<double>(3,1) <<
 				(double)guessCameraFrame.x(), (double)guessCameraFrame.y(), (double)guessCameraFrame.z());
 
+		// 使用 RANSAC (Random Sample Consensus) 迭代求解 Perspective-n-Point 问题。
+		// 它会在存在误匹配（Outliers）的情况下，试图找到符合大多数点的最佳位姿（旋转 rvec和平移 tvec）。
+		// 输出：inliers: 被认定为正确匹配的特征点索引列表。
 		util3d::solvePnPRansac(
 				objectPoints,
 				imagePoints,
@@ -144,14 +147,18 @@ Transform estimateMotion3DTo2D(
 				flagsPnP,
 				refineIterations);
 
+		// 如果找到的内点数量足够
 		if((int)inliers.size() >= minInliers)
 		{
-			cv::Rodrigues(rvec, R);
+			cv::Rodrigues(rvec, R);  // 将旋转向量转为旋转矩阵
 			Transform pnp(R.at<double>(0,0), R.at<double>(0,1), R.at<double>(0,2), tvec.at<double>(0),
 						   R.at<double>(1,0), R.at<double>(1,1), R.at<double>(1,2), tvec.at<double>(1),
-						   R.at<double>(2,0), R.at<double>(2,1), R.at<double>(2,2), tvec.at<double>(2));
-
-			transform = (cameraModel.localTransform() * pnp).inverse();
+						   R.at<double>(2,0), R.at<double>(2,1), R.at<double>(2,2), tvec.at<double>(2));  // 构造 4x4 变换矩阵
+			// 这里的 localTransform() 应该是相机相对于机器人基座的变换矩阵。
+			// pnp 是从相机坐标系到世界坐标系的变换。
+			// (cameraModel.localTransform() * pnp) 得到的是从机器人基座到世界坐标系的变换。
+			// .inverse() 得到的是从世界坐标系到机器人基座的变换，也就是我们想要的机器人位姿。
+			transform = (cameraModel.localTransform() * pnp).inverse(); // 转换到机器人基座坐标系
 
 			// compute variance (like in PCL computeVariance() method of sac_model.h)
 			if(covariance && (!words3B.empty() || cameraModel.imageSize() != cv::Size()))
@@ -175,6 +182,7 @@ Transform estimateMotion3DTo2D(
 					cv::Point3f objPt = objectPoints[inliers[i]];
 
 					// Get 3D point from cameraB base frame in cameraA base frame
+					// 将当前帧的点转换到map坐标系，与实际中的map点对比(即wordA),获取误差
 					std::map<int, cv::Point3f>::const_iterator iter = words3B.find(matches[inliers[i]]);
 					cv::Point3f newPt;
 					if(iter!=words3B.end() && util3d::isFinite(iter->second))
@@ -197,6 +205,7 @@ Transform estimateMotion3DTo2D(
 								cameraModel.fx(),
 								cameraModel.fy());
 						// transform in camera B frame
+						// 将点投影回 3D 射线，并人为乘以 1.1（即增加 10% 的深度误差）
 						newPt = cv::Point3f(ray.x(), ray.y(), ray.z()) * objPtCamBFrame.z*1.1; // Add 10 % error
 
 						//transform back into cameraA base frame
@@ -212,7 +221,7 @@ Transform estimateMotion3DTo2D(
 						errorSqrdY[i] = errorY * errorY;
 						errorSqrdZ[i] = errorZ * errorZ;
 					}
-
+					// 计算原始点(map)与带误差点(当前帧)之间的距离平方
 					errorSqrdDists[i] = uNormSquared(objPt.x-newPt.x, objPt.y-newPt.y, objPt.z-newPt.z);
 
 					Eigen::Vector4f v1(objPt.x, objPt.y, objPt.z, 0);
@@ -220,14 +229,20 @@ Transform estimateMotion3DTo2D(
 					errorSqrdAngles[i] = pcl::getAngle3D(v1, v2);
 				}
 
+				// ... 排序后取中位数 ...
 				std::sort(errorSqrdDists.begin(), errorSqrdDists.end());
 				//divide by 4 instead of 2 to ignore very very far features (stereo)
+				// 除以 varianceMedianRatio(默认为4) 而不是 2 是因为立体视觉（stereo）系统中，特征点可能分布在远处，导致深度误差较大。
+				// 系数 2.1981 是统计学常数（卡方分布相关），用于将中位数绝对偏差（MAD）转换为标准差估计。
 				double median_error_sqr_lin = 2.1981 * (double)errorSqrdDists[errorSqrdDists.size () / varianceMedianRatio];
 				UASSERT(uIsFinite(median_error_sqr_lin));
+				// 用中位数误差缩放平移部分的协方差
+				// 如果用于匹配的特征点主要集中在远处（深度大），或者特征点的分布对深度误差非常敏感，计算出的位姿协方差就会非常大。
 				(*covariance)(cv::Range(0,3), cv::Range(0,3)) *= median_error_sqr_lin;
 				std::sort(errorSqrdAngles.begin(), errorSqrdAngles.end());
 				double median_error_sqr_ang = 2.1981 * (double)errorSqrdAngles[errorSqrdAngles.size () / varianceMedianRatio];
 				UASSERT(uIsFinite(median_error_sqr_ang));
+				// 用中位数误差缩放旋转部分的协方差
 				(*covariance)(cv::Range(3,6), cv::Range(3,6)) *= median_error_sqr_ang;
 
 				if(splitLinearCovarianceComponents)
@@ -249,6 +264,7 @@ Transform estimateMotion3DTo2D(
 					median_error_sqr_lin = uMax3(median_error_sqr_x, median_error_sqr_y, median_error_sqr_z);
 				}
 
+				// 如果深度误差导致的位姿不确定性过大，整个运动估计会被丢弃：
 				if(maxVariance > 0 && median_error_sqr_lin > maxVariance)
 				{
 					UWARN("Rejected PnP transform, variance is too high! %f > %f!", median_error_sqr_lin, maxVariance);

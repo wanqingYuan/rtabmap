@@ -2835,21 +2835,51 @@ void Memory::deleteLocation(int locationId, std::list<int> * deletedWords)
 	}
 }
 
+/**
+ * @brief Memory::saveLocationData
+ * @param locationId 节点id
+ * 
+ * 将数据持久化到数据库中。保存的主要数据包括：
+ * 唯一标识符 (ID)
+ * 	_id: 节点的唯一 ID。
+ * 	_mapId: 所属地图的 ID（RTAB-Map 支持多地图管理）。
+ * 传感器数据 (SensorData)
+ * 	图像数据：RGB 图像、深度图（Depth image）。在数据库中通常保存为压缩格式（JPG/PNG）。
+ * 	激光雷达：2D 或 3D 激光扫描数据（Laser Scan）。
+ * 	用户数据：如果用户传入了自定义数据（User Data），也会一并保存。
+ * 位姿信息 (Transform)
+ * 	_pose: 该节点在地图中的估计位姿（Odometry Pose 或 优化后的 Pose）。
+ * 	_groundTruthPose: 真实位姿（如果有）。
+ * 图链接 (Links)
+ * 	_links: 存储与图中其他节点的约束关系（Link 类）。类型包括：
+ * 		kNeighbor: 邻居节点（前后帧的里程计约束）。
+ * 		kGlobalClosure: 全局回环约束（BoW 检测到的）。
+ * 		kLocalSpaceClosure: 局部空间回环（Proximity detection）。
+ * 		kPosePrior: 先验位姿约束。
+ * 视觉特征 (Keypoints & Descriptors)
+ * 	_words: 视觉词袋（Bag-of-Words）索引，用于快速回环检测。
+ * 	_wordsKpts: 特征点在图像中的 2D 坐标。
+ * 	_words3: 特征点对应的 3D 坐标（从深度图或双目恢复）。
+ * 	_wordsDescriptors: 特征描述子（如 BRIEF, SURF, ORB 等）。
+ */
 void Memory::saveLocationData(int locationId)
 {
 	UDEBUG("Saving location data %d", locationId);
 	Signature * location = _getSignature(locationId);
 	if( location &&
 		_dbDriver &&
-		!_dbDriver->isInMemory() && // don't push in database if it is also in memory.
+		!_dbDriver->isInMemory() && // 首先检查是否处于增量内存模式（_incrementalMemory，即 Mapping 模式）。
 		location->id()>0 &&
 		(_incrementalMemory && !location->isSaved()))
 	{
 		Signature * cpy = new Signature();
 		*cpy = *location;
+		// 异步保存：它会创建一个当前 Signature 的副本，并调用 _dbDriver->asyncSave(cpy) 将数据异步写入 SQLite 数据库。
 		_dbDriver->asyncSave(cpy);
 
 		location->setSaved(true);
+		// 内存释放：保存触发后，为了节省 RAM，它会立即调用 location->sensorData().clearCompressedData() 
+		// 清除内存中的压缩传感器数据（如图片），只保留元数据和特征（Visual Words）在工作内存（Working Memory）或长期内存（LTM）中。
 		location->sensorData().clearCompressedData();
 	}
 }

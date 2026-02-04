@@ -135,7 +135,14 @@ void OptimizerGTSAM::parseParameters(const ParametersMap & parameters)
 	}
 #endif
 }
-
+// 核心函数：执行GTSAM优化
+// rootId: 一般设为最新的关键帧ID，或者根据GPS/先验确定的根节点ID
+// poses: 当前图中所有的位姿节点 (ID -> Transform)
+// edgeConstraints: 图中的边/约束 (链接)，包括里程计、闭环、Link
+// outputCovariance: 输出最后节点的协方差矩阵 (用于评估不确定度)
+// intermediateGraphes: (可选) 用于调试，保存中间迭代过程的图
+// finalError: (可选) 返回最终的残差
+// iterationsDone: (可选) 返回实际迭代次数
 std::map<int, Transform> OptimizerGTSAM::optimize(
 		int rootId,
 		const std::map<int, Transform> & poses,
@@ -145,10 +152,12 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		double * finalError,
 		int * iterationsDone)
 {
+	// 1. 初始化输出协方差为单位阵
 	outputCovariance = cv::Mat::eye(6,6,CV_64FC1);
 	std::map<int, Transform> optimizedPoses;
-#ifdef RTABMAP_GTSAM
+#ifdef RTABMAP_GTSAM // 确保编译了GTSAM库
 
+	// 2. 检查是否禁用了Vertigo但开启了Robust模式
 #ifndef RTABMAP_VERTIGO
 	if(this->isRobust())
 	{
@@ -158,33 +167,41 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 #endif
 
 	UDEBUG("Optimizing graph...");
+	// 必须至少有1个边和2个节点，且迭代次数>0才进行优化
 	if(edgeConstraints.size()>=1 && poses.size()>=2 && iterations() > 0)
 	{
-		gtsam::NonlinearFactorGraph graph;
+		gtsam::NonlinearFactorGraph graph; // 创建GTSAM的因子图对象
 
 		// detect if there is a global pose prior set, if so remove rootId
+		// 3. 全局先验检测 (GPS / Gravity)
+		// 如果有GPS先验，通常不需要固定Root节点(rootId=0)，或者需要特殊处理
 		bool hasGPSPrior = false;
 		bool hasGravityConstraints = false;
 		if(!priorsIgnored() || (!isSlam2d() && gravitySigma() > 0))
 		{
+			// 遍历所有边，寻找自相关边 (from==to)，通常用于存储Prior信息
 			for(std::multimap<int, Link>::const_iterator iter=edgeConstraints.begin(); iter!=edgeConstraints.end(); ++iter)
 			{
 				if(iter->second.from() == iter->second.to())
 				{
+					// 检测GPS先验 (PosePrior)
 					if(!priorsIgnored() && iter->second.type() == Link::kPosePrior)
 					{
 						hasGPSPrior = true;
+						// 检查协方差矩阵对角线元素，判断是否包含旋转约束
+						// 如果旋转方差很小(信息矩阵很大)，说明旋转也被GPS/罗盘固定了
 						if ((isSlam2d() && 1 / static_cast<double>(iter->second.infMatrix().at<double>(5,5)) < 9999) ||
 							(1 / static_cast<double>(iter->second.infMatrix().at<double>(3,3)) < 9999.0 &&
 							 1 / static_cast<double>(iter->second.infMatrix().at<double>(4,4)) < 9999.0 &&
 							 1 / static_cast<double>(iter->second.infMatrix().at<double>(5,5)) < 9999.0))
 						{
 							// orientation is set, don't set root prior (it is no GPS)
-							rootId = 0;
-							hasGPSPrior = false;
+							rootId = 0; // 如果有全向GPS，不需要人为指定Root固定
+							hasGPSPrior = false; // 标记改为由外部约束处理
 							break;
 						}
 					}
+					// 检测重力约束 (IMU Gravity)
 					if(iter->second.type() == Link::kGravity)
 					{
 						hasGravityConstraints = true;
@@ -201,6 +218,8 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		gtsam::FactorIndices removeFactorIndices;
 
 		//prior first pose
+		// 4. 设置首个节点的先验 (Anchor/Prior Factor)
+		// 如果没有GPS先验，我们需要固定第一个节点（Root）防止图在空间中乱飘（零空间问题）
 		if(rootId != 0 && (!isam2_ || lastRootFactorIndex_.first != rootId))
 		{
 			UDEBUG("Setting prior for rootId=%d", rootId);
@@ -209,12 +228,16 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			UDEBUG("hasGPSPrior=%s", hasGPSPrior?"true":"false");
 			if(isSlam2d())
 			{
+				// 2D: 固定 x, y, theta
+				// 噪声模型: 如果有外部GPS(hasGPSPrior)，则允许稍微大一点的浮动(1e-2)，否则锁死(1e-9)
 				gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector3(0.01, 0.01, hasGPSPrior?1e-2:1e-9));
 				graph.add(gtsam::PriorFactor<gtsam::Pose2>(rootId, gtsam::Pose2(initialPose.x(), initialPose.y(), initialPose.theta()), priorNoise));
 				addedPrior.push_back(ConstraintToFactor(rootId, rootId, -1));
 			}
 			else
 			{
+				// 3D: 固定 x,y,z, roll,pitch,yaw
+				// 如果有重力约束，Reset Roll/Pitch的方差允许大一些(让重力因子去约束)
 				gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances(
 						(gtsam::Vector(6) <<
 								(hasGravityConstraints?2:1e-2), (hasGravityConstraints?2:1e-2), (hasGPSPrior?1e-2:1e-9), // roll, pitch, fixed yaw if there are no priors
@@ -223,16 +246,19 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				graph.add(gtsam::PriorFactor<gtsam::Pose3>(rootId, gtsam::Pose3(initialPose.toEigen4d()), priorNoise));
 				addedPrior.push_back(ConstraintToFactor(rootId, rootId, -1));
 			}
+			// iSAM2 特殊处理: 如果Root变了，可能需要重置iSAM2系统
 			if(isam2_ && lastRootFactorIndex_.first!=0)
 			{
 				if(uContains(poses, lastRootFactorIndex_.first))
 				{
 					UDEBUG("isam2: switching rootid from %d to %d", lastRootFactorIndex_.first, rootId);
+					// 如果旧Root还存在，移除旧Root的Prior因子
 					removeFactorIndices.push_back(lastRootFactorIndex_.second);
 				}
 				else
 				{
 					UDEBUG("isam2: reset iSAM2, disjoint mapping sessions between previous root %d and new root %d", lastRootFactorIndex_.first, rootId);
+					// 地图不连续，彻底重置iSAM2
 					// reset iSAM2, disjoint mapping session
 					gtsam::ISAM2Params params = isam2_->params();
 					delete isam2_;
@@ -246,6 +272,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			}
 		}
 
+		// 5. 准备新增的节点和边
 		std::map<int, Transform> newPoses;
 		std::multimap<int, Link> newEdgeConstraints;
 
@@ -253,6 +280,8 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		{
 			UDEBUG("Add new poses...");
 			// new poses?
+			// iSAM2 增量模式：只筛选出还没有加入系统的 Pose 和 Link
+			// addedPoses_ 记录了已经在系统里的节点ID
 			for(std::map<int, Transform>::const_iterator iter=poses.begin(); iter!=poses.end(); ++iter)
 			{
 				if(addedPoses_.find(iter->first) == addedPoses_.end())
@@ -265,6 +294,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			// new links?
 			for(std::multimap<int, Link>::const_iterator iter=edgeConstraints.begin(); iter!=edgeConstraints.end(); ++iter)
 			{
+				// 只要边的两端有任意一端是新的，或者是某些特殊的边，就加入
 				if(addedPoses_.find(iter->second.from()) == addedPoses_.end() ||
 				   addedPoses_.find(iter->second.to()) == addedPoses_.end())
 				{
@@ -273,6 +303,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				}
 			}
 
+			// 非鲁棒模式下，如果之前的闭环边被拒绝了，需要从iSAM中移除
 			if(!this->isRobust())
 			{
 				UDEBUG("Remove links...");
@@ -301,12 +332,15 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		}
 		else
 		{
+			// Batch模式：每次都使用所有的节点和边
 			newPoses = poses;
 			newEdgeConstraints = edgeConstraints;
 		}
 
 		UDEBUG("fill poses to gtsam... rootId=%d (priorsIgnored=%d landmarksIgnored=%d)",
 				rootId, priorsIgnored()?1:0, landmarksIgnored()?1:0);
+		// 6. 将节点 (Initial Estimate) 填入 GTSAM
+		// 初始估计值 (Initial Guess) 对非线性优化非常重要，通常直接用里程计推算的值
 		gtsam::Values initialEstimate;
 		std::map<int, bool> isLandmarkWithRotation;
 		for(std::map<int, Transform>::const_iterator iter = newPoses.begin(); iter!=newPoses.end(); ++iter)
@@ -314,6 +348,8 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			UASSERT(!iter->second.isNull());
 			if(isSlam2d())
 			{
+				// 插入2D位姿 (Pose2)
+				// 处理Landmark (路标点): 有些路标只有位置没有方向 (Point2)
 				if(iter->first > 0)
 				{
 					initialEstimate.insert(iter->first, gtsam::Pose2(iter->second.x(), iter->second.y(), iter->second.theta()));
@@ -341,6 +377,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			}
 			else
 			{
+				// 插入3D位姿 (Pose3)
 				if(iter->first > 0)
 				{
 					initialEstimate.insert(iter->first, gtsam::Pose3(iter->second.toEigen4d()));
@@ -374,6 +411,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		{
 			lastSwitchId_ = newPoses.rbegin()->first+1;
 		}
+		// 7. 将边 (Constraints) 填入 GTSAM
 		for(std::multimap<int, Link>::const_iterator iter=newEdgeConstraints.begin(); iter!=newEdgeConstraints.end(); ++iter)
 		{
 			int id1 = iter->second.from();
@@ -385,9 +423,13 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			UASSERT(!iter->second.transform().isNull());
 			if(id1 == id2)
 			{
+				// --- 处理一元因子 (Unary Factor) ---
+				// 如 GPS Prior (Link::kPosePrior) 或 重力约束 (Link::kGravity)
 				if(iter->second.type() == Link::kPosePrior && !priorsIgnored() &&
 				  (!landmarksIgnored() || id1>0))
 				{
+					// 构建噪声模型 (Information Matrix -> Noise Model)
+					// 添加 PriorFactor
 					if(isSlam2d())
 					{
 						if(id1 < 0 && !isLandmarkWithRotation.at(id1))
@@ -471,6 +513,8 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				}
 				else if(!isSlam2d() && gravitySigma() > 0 && iter->second.type() == Link::kGravity && newPoses.find(iter->first) != newPoses.end())
 				{
+					// 添加重力因子 Pose3GravityFactor
+					// 这会约束 Z轴 必须和重力方向对齐 (Roll/Pitch 约束)
 					Vector3 r = gtsam::Pose3(iter->second.transform().toEigen4d()).rotation().xyz();
 					gtsam::Unit3 nG = gtsam::Rot3::RzRyRx(r.x(), r.y(), 0).rotate(gtsam::Unit3(0,0,-1));
 					gtsam::SharedNoiseModel model = gtsam::noiseModel::Isotropic::Sigmas(gtsam::Vector2(gravitySigma(), gravitySigma()));
@@ -480,6 +524,9 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			}
 			else if(id1<0 || id2 < 0)
 			{
+				// --- 处理二元因子 (Binary Factor) ---
+				// 就是常见的两个位姿之间的边的约束
+				// 用于 Switchable Loop Closure 的准备
 				if(!landmarksIgnored())
 				{
 					//landmarks
@@ -503,6 +550,9 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 						// "Since it is reasonable to initially accept all loop closure constraints,
 						//  a proper and convenient initial value for all switch variables would be
 						//  sij = 1 when using the linear switch function"
+						// 如果开启鲁棒优化，并且不是紧邻的下一帧(里程计)，而是闭环边
+						// 创建 Switch Variable (s_ij) 初始值为 1.0 (由于 Prior Factor)
+						// 并添加 PriorFactor 约束 s_ij 接近 1.0
 						double prior = 1.0;
 						initialEstimate.insert(gtsam::Symbol('s',lastSwitchId_), vertigo::SwitchVariableLinear(prior));
 
@@ -522,6 +572,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 
 					if(isSlam2d())
 					{
+						// 构建噪声模型
 						if(isLandmarkWithRotation.at(id2))
 						{
 							Eigen::Matrix<double, 3, 3> information = Eigen::Matrix<double, 3, 3>::Identity();
@@ -543,11 +594,14 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 							if(this->isRobust())
 							{
 								// create switchable edge factor
+								// 使用 Vertigo 的可开关因子: BetweenFactorSwitchableLinear
+								// 这种因子受 s_ij 控制。如果 s_ij 优化后变为0，则此边权重降为0，不影响图优化
 								graph.add(vertigo::BetweenFactorSwitchableLinear<gtsam::Pose2>(id1, id2, gtsam::Symbol('s', lastSwitchId_++), gtsam::Pose2(t.x(), t.y(), t.theta()), model));
 							}
 							else
 #endif
 							{
+								// 标准 Gtsam Factor: BetweenFactor
 								graph.add(gtsam::BetweenFactor<gtsam::Pose2>(id1, id2, gtsam::Pose2(t.x(), t.y(), t.theta()), model));
 								lastAddedConstraints_.push_back(ConstraintToFactor(id1, id2, -1));
 							}
@@ -740,11 +794,14 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		}
 
 		UDEBUG("create optimizer");
+		// 8. 创建优化器 (Optimizer)
 		gtsam::NonlinearOptimizer * optimizer = 0;
 
 		if(!isam2_) // Batch optimization
 		{
 			UDEBUG("Batch optimization...");
+			// 根据配置选择优化算法: G-N, Levenberg-Marquardt (LM), Dogleg
+			// LM 算法在SLAM种最常用，稳定性好
 			if(internalOptimizerType_ == 2)
 			{
 				gtsam::DoglegParams parameters;
@@ -777,8 +834,10 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		int it = 0;
 		double initialError = optimizer?graph.error(initialEstimate):0;
 		double lastError = optimizer?optimizer->error():0;
+		// 9. 执行优化迭代
 		for(int i=0; i<iterations(); ++i)
 		{
+			// (可选) 如果需要中间画图，把当前结果存到 intermediateGraphes
 			if(intermediateGraphes && i > 0)
 			{
 				float x,y,z,roll,pitch,yaw;
@@ -849,13 +908,14 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 			{
 				if(optimizer) // Batch optimization
 				{
-					optimizer->iterate();
+					optimizer->iterate(); // 迭代一次
 					error = optimizer->error();
 				}
 				else if(i==0) // iSAM2 (add factors)
 				{
 					UDEBUG("Update iSAM with the new factors");
 					result = isam2_->update(graph, initialEstimate, removeFactorIndices);
+					// iSAM2 也可以多次 update 来让 Bayes Tree 传播
 #if BOOST_VERSION >= 106800
 					UASSERT(result.errorBefore.has_value());
 					UASSERT(result.errorAfter.has_value());
@@ -885,6 +945,7 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				}
 				else // iSAM2 (more iterations)
 				{
+					// iSAM2 后续迭代
 					result = isam2_->update();
 #if BOOST_VERSION >= 106800
 					UASSERT(result.errorBefore.has_value());
@@ -901,7 +962,9 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				++it;
 			}
 			catch(gtsam::IndeterminantLinearSystemException & e)
-			{
+			{		
+				// 捕捉矩阵奇异异常（通常对应约束不足，图是病态的）
+				// 重置 iSAM2 并返回失败
 				UWARN("GTSAM exception caught: %s\n Graph has %d edges and %d vertices", e.what(),
 						(int)newEdgeConstraints.size(),
 						(int)newPoses.size());
@@ -923,6 +986,8 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 
 			// early stop condition
 			UDEBUG("iteration %d error =%f", i+1, error);
+			// 10. 检查收敛条件
+			// 如果误差变化 (errorDelta) 小于 epsilon，则提前停止
 			double errorDelta = lastError - error;
 			if(this->epsilon() > 0.0 && fabs(error) > 1000000000000.0)
 			{
@@ -975,13 +1040,16 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 				it, initialError, lastError, timer.ticks());
 
 		float x,y,z,roll,pitch,yaw;
+		// 11. 获取结果并更新 optimizedPoses
 		const gtsam::Values values = isam2_?isam2_->calculateEstimate():optimizer->values();
 #if GTSAM_VERSION_NUMERIC >= 40200
 		for(gtsam::Values::deref_iterator iter=values.begin(); iter!=values.end(); ++iter)
 #else
 		for(gtsam::Values::const_iterator iter=values.begin(); iter!=values.end(); ++iter)
 #endif
-		{
+		{			
+			// 将 GTSAM 的 Pose2/Pose3 转回 RTAB-Map 的 Transform
+			// 填入 optimizedPoses 返回给调用者
 			int key = (int)iter->key;
 			if(iter->value.dim() > 1 && uContains(poses, key))
 			{
@@ -1035,8 +1103,12 @@ std::map<int, Transform> OptimizerGTSAM::optimize(
 		}
 
 		// compute marginals
+		// 12. 计算边缘协方差 (Marginals)
+		// 这步很费时，通常只计算最后一个节点的协方差，用于根据当前定位的不确定性来决定何时触发新的规划或检测
 		try {
 			UDEBUG("Computing marginals for node %d...", poses.rbegin()->first);
+			// Compute marginals...
+			// 结果填入 outputCovariance
 			UTimer t;
 			gtsam::Matrix info;
 			if(optimizer)

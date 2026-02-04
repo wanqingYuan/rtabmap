@@ -685,6 +685,11 @@ Transform RegistrationVis::computeTransformationImpl(
 				{
 					std::vector<float> err;
 					UDEBUG("cv::calcOpticalFlowPyrLK() begin");
+					// 使用 光流法 (Lucas-Kanade Optical Flow) 来在两帧图像之间寻找特征点对应关系（Matches）
+					// 相对于传统的“特征点提取 + 描述子匹配”（如 ORB, SIFT, SURF + BruteForce/FLANN）的另一种策略。
+					// 它的优点是速度快，可以获得亚像素级别的匹配精度，适合连续运动的场景。
+					// 但缺点是需要有初始的特征点（通常需要先用角点检测器如 FAST 或 Harris 找到点），并且对大位移、旋转或遮挡比较敏感。
+					// 在 纯旋转（Pure Rotation） 的情况下，通常 特征匹配（Feature Matching） 的效果要优于 光流法（Optical Flow），特别是当旋转角度较大或发生绕光轴旋转（Roll）时。
 					cv::calcOpticalFlowPyrLK(
 						imageFrom,
 						imageTo,
